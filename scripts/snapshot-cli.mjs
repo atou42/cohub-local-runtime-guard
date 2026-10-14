@@ -32,15 +32,18 @@ export async function createSnapshot({ source, destination, baseline, reviewed }
   const original = await inspectCli(path.join(source, 'bin/cohub.js'));
   const staging = `${destination}.partial-${randomUUID()}`;
   await fs.mkdir(staging, { mode: 0o700 });
-  await fs.cp(source, staging, { recursive: true, dereference: true, errorOnExist: true, force: false });
-  const copied = await inspectCli(path.join(staging, 'bin/cohub.js'));
+  // Node 22 rejects an existing destination directory with errorOnExist.
+  const copiedRoot = path.join(staging, 'package');
+  await fs.cp(source, copiedRoot, { recursive: true, dereference: true, errorOnExist: true, force: false });
+  const copied = await inspectCli(path.join(copiedRoot, 'bin/cohub.js'));
   const after = await inspectCli(path.join(source, 'bin/cohub.js'));
   if (JSON.stringify(original) !== JSON.stringify(copied) || JSON.stringify(original) !== JSON.stringify(after))
     throw new Error(`CLI changed during snapshot; partial copy retained at ${staging}`);
   await requireAbsent(destination);
-  await fs.rename(staging, destination);
+  await fs.rename(copiedRoot, destination);
   await fs.writeFile(baseline, JSON.stringify({ schemaVersion: 1, reviewedVersion: copied.version, fingerprint: copied.fingerprint }, null, 2) + '\n',
     { flag: 'wx', mode: 0o600 });
+  await fs.rmdir(staging);
   return { recoveryCli: path.join(destination, 'bin/cohub.js'), compatibilityFile: baseline, ...copied };
 }
 
