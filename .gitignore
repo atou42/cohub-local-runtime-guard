@@ -1,0 +1,9 @@
+node_modules/
+data/
+reviewed-cli/
+config.local.json
+*.local.json
+*.log
+*.jsonl
+*.tgz
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "home": "/home/YOUR_USER",
+  "root": "/absolute/path/to/YOUR_WORKSPACE",
+  "spaceId": "YOUR_EXISTING_LOCAL_SPACE_ID",
+  "identity": "prod:YOUR_LOGTO_USER_ID",
+  "node": "/absolute/path/to/node",
+  "cli": "/absolute/path/to/global/cohub-cli/bin/cohub.js",
+  "recoveryCli": "/absolute/path/to/reviewed-cli/bin/cohub.js",
+  "compatibilityFile": "/absolute/path/to/guard-baseline.json",
+  "directory": "/absolute/path/to/private/guard-state",
+  "harnesses": ["codex", "pi"],
+  "codex": "/absolute/path/to/codex",
+  "pi": "/absolute/path/to/pi",
+  "shareScreen": false,
+  "readyHooks": false
+}
