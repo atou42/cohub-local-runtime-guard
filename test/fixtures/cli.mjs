@@ -16,7 +16,9 @@ async function owner() {
 }
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { if (e.code === 'ESRCH') return false; throw e; } };
 const emit = x => console.log(JSON.stringify(x));
-if (args[0] === 'auth') {
+if (args[0] === 'network-env') {
+  emit({ httpProxy: process.env.HTTP_PROXY, httpsProxy: process.env.HTTPS_PROXY, noProxy: process.env.NO_PROXY });
+} else if (args[0] === 'auth') {
   emit({ source: 'logto', user: { profile: { logtoUserId: setup.identity.slice(5) } } });
 } else if (args[1] === 'logs') {
   emit([{ timestamp: new Date().toISOString(), event: 'runtime.websocket.closed', data: { code: 1006, activeExecutions: 2, cmd: 'private command' } }]);

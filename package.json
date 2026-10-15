@@ -5,6 +5,6 @@
   "description": "A conservative local recovery watchdog for Cohub Runtime",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=22" },
+  "engines": { "node": "^22.21.0 || >=24.0.0" },
   "scripts": { "test": "node --test test/*.test.mjs" }
 }

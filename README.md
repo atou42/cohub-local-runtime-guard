@@ -15,7 +15,7 @@ This is an independent recovery tool, not an official Cohub component and not a 
 
 ## Requirements
 
-Node.js 22 or newer, a separately installed Cohub CLI, and an existing authorized Local Runtime. No npm dependencies or installation hooks are required for this project.
+Node.js 22.21+ or 24+, a separately installed Cohub CLI, and an existing authorized Local Runtime. No npm dependencies or installation hooks are required for this project.
 
 The production watchdog has been exercised on macOS. The synthetic process tests also run in Linux CI; that is not a claim of Linux production validation. Windows is not supported. Native consent configuration version 2 and the CLI status/control interfaces must match the implementation. The current recovery workflow was checked with Cohub CLI 10.1.0; a fingerprint is change detection, not a security audit or a guarantee of future server protocol compatibility.
 
@@ -72,6 +72,28 @@ The guard always executes the reviewed copy. `compatibility.version` is that rec
 
 Only a damaged reviewed copy or baseline blocks recovery. This protection is not bypassed. To adopt a newer CLI, review and test it, create a new snapshot and baseline at new paths, pause/stop the guard, update its configuration, run `check`, then restart and resume the guard. Do not modify a reviewed copy in place or regenerate a fingerprint merely to silence an error. The guard does not auto-upgrade Cohub, automatically review releases, or promise indefinite compatibility with server changes.
 
+## Proxy And Network Supervision
+
+Every CLI call refreshes network configuration. Explicit HTTP/HTTPS environment settings take priority; otherwise macOS HTTP/HTTPS system proxies are read again, including exception lists. Lowercase variables are normalized, contradictory uppercase/lowercase values are rejected, and HTTP `ALL_PROXY` is translated consistently for Node and the workspace transport. SOCKS URLs and PAC/WPAD are detected but are not silently treated as direct connections. System HTTP-only configuration requires an explicit HTTPS routing decision.
+
+Loopback services stay local through `NO_PROXY`, including IPv6 loopback. Exact host, suffix/wildcard and port-qualified bypass rules are monitored; CIDR system exceptions are preserved with a warning because native Node `NO_PROXY` does not implement CIDR matching. A configured bypass is never silently removed to force traffic through a proxy, and a failed proxy never triggers an unapproved direct-route fallback.
+
+The latest `state.json` contains `network.source`, sanitized per-target routes, a credential-free route fingerprint, proxy TCP checks, fault `code`, remediation `action`, `since` and `nextCheckAt`. Only active target proxies are checked. Endpoint or bypass changes are logged; healthy tasks are not restarted just because configuration changed. Diagnostic HTTP requests use the same route and trust settings as recovery commands, not the guard process's default direct `fetch`.
+
+| Condition | Watchdog response |
+| --- | --- |
+| Proxy disabled, changed address/port or replaced installation | Re-read settings; subsequent probes and launches use the current route. |
+| Proxy refused, unreachable, DNS failure or stalled CONNECT | Record the specific phase, retry current configuration each monitoring cycle, and do not spend Runtime restart budget while that route is blocked. |
+| Proxy returns 407 | Report `proxy_auth_required`; retry after configured credentials change, never guess credentials or log them. |
+| CONNECT rejected, upstream 429/5xx | Distinguish proxy rejection from upstream failure and wait/retry instead of repeatedly killing tasks. |
+| Expired, self-signed or otherwise invalid TLS certificate | Keep verification enabled and report a trust failure. An explicitly supplied, readable PEM `NODE_EXTRA_CA_CERTS` bundle is validated, passed to child processes and rechecked for rotation/removal. Unsafe TLS-disable settings are not inherited. |
+| `NO_PROXY` sends failed target traffic direct | Report bypass-related failure; do not secretly rewrite the user's routing policy. |
+| Network restored but Runtime still disconnected | Require a fresh continuous failure period and valid account/consent/ownership, then perform bounded recovery using the working route. |
+| HTTP works but harness/WebSocket or workspace relay remains disconnected | Keep transport fields visibly disconnected, save connection/lease diagnostics and apply the existing bounded recovery/circuit breaker; do not call the Runtime healthy merely because HTTP succeeds. |
+| Invalid configuration, unsupported PAC/SOCKS or unreadable CA file | Keep fault state and actionable reason, re-read on subsequent cycles, and refuse unsafe recovery. |
+
+Network faults do not consume the Runtime restart allowance; account preflight is also checked before reserving an attempt. The watchdog does **not** restart VPN/proxy applications, edit system proxy settings, install certificates, disable TLS checks, or repair a broken upstream service. Cases requiring those actions stay visibly blocked rather than pretending to be fixed.
+
 ## Run At Login On macOS
 
 An example LaunchAgent is in `examples/launchd.plist`. Replace every `REPLACE_*` value with absolute paths and create the private log directory. Use a unique label for each configured Space, put the completed file in `~/Library/LaunchAgents/`, and load it:
@@ -102,7 +124,7 @@ Optional `readyHooks: true` dispatches existing `.cohub/hooks/*.json` workspace-
 npm test
 ```
 
-Tests use temporary directories, synthetic CLI replies and isolated Node workers. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, and per-workspace isolation.
+Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies and TLS servers; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery.
 
 ## License
 

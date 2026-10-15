@@ -93,6 +93,9 @@ async function fixture(t, target = CONFIG, rootName = null) {
   await fs.writeFile(path.join(home, 'fixture.json'), JSON.stringify({ identity: config.identity, spaceId: config.spaceId, worker: config.worker,
     root: rootOf(config), harnesses: config.harnesses }));
   const g = new Guard(config);
+  g.systemProxyReader = async () => '<dictionary> {}';
+  g.networkSourceEnv = {};
+  g.proxyProbe = async endpoint => ({ ...endpoint, ok: true });
   g.network = async () => [{ host: 'fixture.invalid', httpStatus: 200 }];
   await g.init();
   await fs.mkdir(path.dirname(g.nativeFile), { recursive: true });
@@ -347,6 +350,7 @@ test('changed Runtime code blocks recovery even when the version is unchanged', 
   await assert.rejects(g.preflight(), /CLI compatibility/);
   const state = await g.tick(base());
   assert.equal(state.compatibility.status, 'review_required');
+  assert.equal(state.reason, 'compatibility_error');
   assert.equal(state.action, 'observe');
   assert.equal(state.restarts.length, 0);
   await assert.rejects(fs.access(path.join(g.config.home, 'calls.jsonl')), { code: 'ENOENT' });
@@ -495,4 +499,80 @@ test('public configuration requires explicit scope and an independent recovery C
   await fs.rename(path.resolve(path.dirname(input.cli), '..'), path.join(g.config.home, 'install-in-progress'));
   await fs.writeFile(file, JSON.stringify(input));
   assert.equal((await loadConfig(file)).recoveryCli, input.recoveryCli);
+});
+
+test('proxy configuration and proxy-enabled subprocess flags are applied on every CLI call', async t => {
+  const g = await fixture(t);
+  g.networkSourceEnv = { HTTPS_PROXY: 'http://127.0.0.1:7893' };
+  let result = await g.cli(['network-env']);
+  assert.equal(JSON.parse(result.stdout).httpsProxy, 'http://127.0.0.1:7893/');
+  g.networkSourceEnv = { HTTPS_PROXY: 'http://127.0.0.1:7894' };
+  result = await g.cli(['network-env']);
+  assert.equal(JSON.parse(result.stdout).httpsProxy, 'http://127.0.0.1:7894/');
+  const node = await fs.realpath(g.config.node);
+  g.command = async () => ({ ok: true, stdout: `${process.getuid()} Thu Oct 15 08:00:00 2026 ${node} --use-env-proxy ${g.config.worker}\n` });
+  assert.match(await g.processIdentity(123), /--use-env-proxy/);
+  g.command = async () => ({ ok: true, stdout: `${process.getuid()} Thu Oct 15 08:00:00 2026 ${node} --require /untrusted.js ${g.config.worker}\n` });
+  await assert.rejects(g.processIdentity(123), /approved Runtime worker/);
+});
+
+test('an unavailable proxy never spends restart budget; recovery resumes after route restoration and confirmed outage', async t => {
+  const g = await fixture(t);
+  g.networkSourceEnv = { HTTPS_PROXY: 'http://127.0.0.1:7893' };
+  g.proxyProbe = async endpoint => ({ ...endpoint, ok: false, code: 'proxy_refused' });
+  const blocked = await g.tick(base());
+  assert.equal(blocked.network.code, 'proxy_refused');
+  assert.equal(blocked.action, 'observe');
+  assert.deepEqual(blocked.restarts, []);
+  assert.equal(blocked.failureSince, null);
+  g.proxyProbe = async endpoint => ({ ...endpoint, ok: true });
+  const retry = await g.tick(blocked);
+  assert.equal(retry.action, 'observe');
+  assert.deepEqual(retry.restarts, []);
+  const recovered = await g.tick({ ...retry, failureSince: Date.now() - g.config.unhealthyMs - 1, checkedAt: Date.now() });
+  assert.equal(recovered.lastRecovery.outcome, 'recovered');
+  assert.equal(recovered.restarts.length, 1);
+  assert.equal((await g.probe()).kind, 'healthy');
+});
+
+test('invalid proxy configuration and failed account preflight neither execute destructive commands nor spend budget', async t => {
+  const g = await fixture(t);
+  g.networkSourceEnv = { HTTPS_PROXY: 'socks5://user:secret@proxy.invalid:1080' };
+  const invalid = await g.tick(base());
+  assert.equal(invalid.network.code, 'unsupported_proxy_protocol');
+  assert.deepEqual(invalid.restarts, []);
+  assert.ok(!JSON.stringify(invalid).includes('user:secret'));
+  await assert.rejects(fs.access(path.join(g.config.home, 'calls.jsonl')), { code: 'ENOENT' });
+  g.networkSourceEnv = {};
+  const pending = await g.tick(invalid);
+  g.preflight = async () => { throw Error('Account verification unavailable'); };
+  const deferred = await g.tick({ ...pending, failureSince: Date.now() - g.config.unhealthyMs - 1, checkedAt: Date.now() });
+  assert.equal(deferred.lastRecovery.outcome, 'deferred');
+  assert.deepEqual(deferred.restarts, []);
+  assert.ok((await calls(g)).every(args => !args.includes('up') && !args.includes('down')));
+});
+
+test('corrupt network monitor state is preserved rather than reset', async t => {
+  const g = await fixture(t);
+  await fs.writeFile(g.stateFile, JSON.stringify({ ...base(), network: { code: 'proxy_refused' } }));
+  await assert.rejects(g.loadState(), /Invalid guard state/);
+  assert.equal(JSON.parse(await fs.readFile(g.stateFile, 'utf8')).network.code, 'proxy_refused');
+});
+
+test('a proxy change immediately before stop defers recovery without consuming budget or stopping the existing worker', async t => {
+  const g = await fixture(t);
+  await g.recover(await g.probe());
+  const owner = await g.owner();
+  await setFixture(g, { stuck: true });
+  const pending = await g.tick(base());
+  const invoke = g.cli.bind(g);
+  g.cli = async (args, timeout, beforeExecute) => {
+    if (args[1] === 'down') g.networkSourceEnv = { HTTPS_PROXY: 'socks5://proxy.invalid:1080' };
+    return invoke(args, timeout, beforeExecute);
+  };
+  const result = await g.tick({ ...pending, failureSince: Date.now() - g.config.unhealthyMs - 1, checkedAt: Date.now() });
+  assert.equal(result.lastRecovery.outcome, 'deferred');
+  assert.deepEqual(result.restarts, []);
+  assert.ok(await g.processIdentity(owner.pid));
+  assert.ok((await calls(g)).every(args => !args.includes('down')));
 });

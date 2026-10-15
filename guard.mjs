@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { lookup } from 'node:dns/promises';
 import os from 'node:os';
 import { parseArgs } from 'node:util';
+import { resolveNetworkPolicy, probeProxy, assessNetwork, NetworkConfigurationError } from './network-env.mjs';
 
 export const CONFIG = Object.freeze({
   home: os.homedir(),
@@ -245,7 +246,7 @@ export function safeRuntimeEvents(events) {
   }));
 }
 
-async function networkEvidence() {
+async function networkEvidence(httpProbe) {
   const result = [];
   for (const host of ['api.cohub.live', 'gateway.cohub.live']) {
     const entry = { host };
@@ -257,9 +258,7 @@ async function networkEvidence() {
     } catch (e) { entry.dnsError = redact(e.message); }
     finally { clearTimeout(timer); }
     try {
-      const response = await fetch(`https://${host}/`, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(3000) });
-      entry.httpStatus = response.status;
-      await response.body?.cancel();
+      Object.assign(entry, await httpProbe(`https://${host}/`));
     } catch (e) { entry.error = redact(e.message); entry.cause = redact(e.cause?.code ?? e.cause?.message); }
     entry.elapsedMs = Date.now() - started;
     result.push(entry);
@@ -280,6 +279,14 @@ export class Guard {
     this.env = { HOME: config.home, USER: username, LOGNAME: username, LANG: 'en_US.UTF-8',
       PATH: `${path.dirname(config.node)}:${config.home}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
       COHUB_CLI_AUTO_UPDATE: '0', PI_OFFLINE: '1' };
+    this.baseEnv = { ...this.env };
+    this.networkSourceEnv = process.env;
+    this.proxyProbe = probeProxy;
+    this.systemProxyReader = async () => {
+      const result = await this.command('/usr/sbin/scutil', ['--proxy'], 3000);
+      if (!result.ok) throw new Error('Cannot read current system proxy settings');
+      return result.stdout;
+    };
   }
   async init() {
     await fs.mkdir(this.config.directory, { recursive: true, mode: 0o700 });
@@ -297,7 +304,39 @@ export class Guard {
           killed: error?.killed === true, stdout, stderr }));
     });
   }
-  cli(args, timeout) { return this.command(this.config.node, [this.config.recoveryCli || this.config.cli, ...args], timeout); }
+  async refreshNetworkEnvironment() {
+    this.networkRoute = 'unknown';
+    this.networkPolicy = null;
+    this.networkConfigError = null;
+    try {
+      const policy = await resolveNetworkPolicy({ env: this.networkSourceEnv, platform: process.platform, readSystemProxy: this.systemProxyReader });
+      this.env = { ...this.baseEnv, ...policy.env };
+      this.networkPolicy = policy.summary;
+      this.networkRoute = policy.summary.route;
+      if (this.networkRoute === 'configured_proxy') {
+        const node = await fs.realpath(this.config.node);
+        const stat = await fs.stat(node);
+        const key = `${node}:${stat.mtimeMs}:${stat.size}`;
+        if (this.proxyNodeVersionKey !== key) {
+          const result = await this.command(this.config.node, ['--version'], 3000);
+          const match = result.ok && result.stdout.trim().match(/^v(\d+)\.(\d+)\.\d+$/);
+          if (!match || !(Number(match[1]) >= 24 || (Number(match[1]) === 22 && Number(match[2]) >= 21)))
+            throw new NetworkConfigurationError('proxy_runtime_unsupported', 'Proxy routing requires Node 22.21+ or 24+', 'upgrade_guard_node');
+          this.proxyNodeVersionKey = key;
+        }
+      }
+    } catch (error) {
+      this.env = { ...this.baseEnv };
+      this.networkConfigError = { code: error.code ?? 'proxy_settings_unreadable', message: redact(error.message), action: error.action ?? 'correct_proxy_configuration' };
+      throw error;
+    }
+  }
+  async cli(args, timeout, beforeExecute) {
+    await this.refreshNetworkEnvironment();
+    if (beforeExecute) await beforeExecute();
+    return this.command(this.config.node, [...(this.networkRoute === 'configured_proxy' ? ['--use-env-proxy'] : []),
+      this.config.recoveryCli || this.config.cli, ...args], timeout);
+  }
   async probe() {
     const result = await this.cli(['runtime', 'status', '--space', this.config.spaceId, '--json'], this.config.probeTimeoutMs);
     if (!result.ok && result.killed) throw new Error(`Runtime probe timed out after ${this.config.probeTimeoutMs} ms`);
@@ -317,7 +356,12 @@ export class Guard {
         !(state.checkedAt === null || Number.isFinite(state.checkedAt)) ||
         !(state.failureSince === null || Number.isFinite(state.failureSince)) ||
         !(state.candidate === null || typeof state.candidate === 'string') ||
-        !(state.readyRuntimeId === undefined || state.readyRuntimeId === null || typeof state.readyRuntimeId === 'string'))
+        !(state.readyRuntimeId === undefined || state.readyRuntimeId === null || typeof state.readyRuntimeId === 'string') ||
+        (state.network !== undefined && (!state.network || typeof state.network.code !== 'string' || typeof state.network.status !== 'string' ||
+          !['healthy', 'blocked', 'degraded', 'not_checked'].includes(state.network.status) ||
+          (state.network.fingerprint !== undefined && !/^[a-f0-9]{64}$/.test(state.network.fingerprint)) ||
+          !Number.isFinite(state.network.since) || !Number.isFinite(state.network.checkedAt) || !Number.isFinite(state.network.nextCheckAt) ||
+          typeof state.network.blockRecovery !== 'boolean')))
       throw new Error('Invalid guard state; original file retained');
     return state;
   }
@@ -340,7 +384,8 @@ export class Guard {
     const workers = [this.config.worker];
     if (this.config.recoveryCli)
       workers.push(path.resolve(path.dirname(this.config.recoveryCli), '../dist/runtime/worker.js'));
-    if (!text.startsWith(`${process.getuid()} `) || !workers.some(worker => text.endsWith(`${node} ${worker}`)))
+    if (!text.startsWith(`${process.getuid()} `) || !workers.some(worker =>
+      text.endsWith(`${node} ${worker}`) || text.endsWith(`${node} --use-env-proxy ${worker}`)))
       throw new Error('PID is not the approved Runtime worker');
     return text;
   }
@@ -383,7 +428,9 @@ export class Guard {
     return result;
   }
   async snapshot(reason, sample) {
-    const result = await this.cli(['runtime', 'logs', '--space', this.config.spaceId, '--limit', '1000', '--level', 'debug', '--json']);
+    let result;
+    try { result = await this.cli(['runtime', 'logs', '--space', this.config.spaceId, '--limit', '1000', '--level', 'debug', '--json']); }
+    catch (error) { result = { ok: false, stderr: redact(error.message) }; }
     let events = null;
     let diagnosticsError = null;
     if (result.ok) {
@@ -396,15 +443,40 @@ export class Guard {
     } else diagnosticsError = redact(result.stderr || result.stdout || String(result.code));
     const name = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}.json`;
     const directory = path.join(this.config.directory, 'incidents');
+    let network;
+    try { network = await this.network(); }
+    catch (error) { network = [{ fault: this.networkConfigError?.code ?? 'network_diagnostics_failed', error: redact(error.message) }]; }
     await atomicJson(path.join(directory, name), redact({ reason, sample, events, diagnosticsError,
-      network: await this.network(), nodeVersion: process.version,
+      network, nodeVersion: process.version,
       cliVersion: (await readJson(path.join(path.dirname(this.config.recoveryCli || this.config.cli), '../package.json'))).version }));
     const names = (await fs.readdir(directory)).filter(n => /^\d{4}-.*\.json$/.test(n)).sort();
     for (const old of names.slice(0, -10)) await fs.unlink(path.join(directory, old));
     await this.log('incident_saved', { reason, file: name, diagnosticsError });
   }
-  network() { return networkEvidence(); }
-  async recover(sample) {
+  async httpProbe(url) {
+    const result = await this.command(this.config.node, [...(this.networkRoute === 'configured_proxy' ? ['--use-env-proxy'] : []),
+      fileURLToPath(new URL('./probe-http.mjs', import.meta.url)), url], 7000);
+    if (!result.ok) return { fault: result.killed ? 'transport_timeout' : 'diagnostic_failed', action: 'check_network_diagnostics' };
+    const parsed = JSON.parse(result.stdout);
+    if (!parsed || (parsed.httpStatus === undefined && typeof parsed.fault !== 'string')) throw new Error('Invalid HTTP probe result');
+    return parsed;
+  }
+  async network() {
+    await this.refreshNetworkEnvironment();
+    return networkEvidence(async url => ({ ...await this.httpProbe(url), route: this.networkRoute }));
+  }
+  async monitorNetwork(sample, previous) {
+    const now = Date.now();
+    if (!this.networkPolicy && !this.networkConfigError)
+      return { status: 'not_checked', code: 'not_checked', action: 'check_cli_compatibility', since: now,
+        checkedAt: now, nextCheckAt: now + this.config.intervalMs, blockRecovery: true };
+    const proxyChecks = this.networkConfigError ? [] : await Promise.all(this.networkPolicy.endpoints.map(endpoint => this.proxyProbe(endpoint)));
+    const diagnostics = !this.networkConfigError && proxyChecks.every(check => check.ok) &&
+      ['remote_unavailable', 'probe_error'].includes(sample.kind) ? await this.network() : [];
+    return assessNetwork({ summary: this.networkPolicy, configError: this.networkConfigError, sample,
+      proxyChecks, diagnostics, now, intervalMs: this.config.intervalMs, previous });
+  }
+  async recover(sample, beforeMutation) {
     await this.preflight();
     if (await this.paused()) return { outcome: 'skipped', reason: 'paused' };
     const fresh = await this.probe();
@@ -417,7 +489,7 @@ export class Guard {
       if (!identity) return { outcome: 'skipped', reason: 'Process exited before stop' };
       await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId });
       const deadline = Date.now() + this.config.graceMs;
-      const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs);
+      const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs, beforeMutation);
       await this.log('graceful_stop', { ok: stopped.ok, code: stopped.code, error: stopped.ok ? null : redact(stopped.stderr || stopped.stdout) });
       while (await this.processIdentity(sample.pid)) {
         if (Date.now() >= deadline) break;
@@ -449,7 +521,7 @@ export class Guard {
     // Screen sharing must be explicitly enabled in the guard configuration.
     const start = await this.cli(['runtime', 'up', rootOf(this.config), '--space', this.config.spaceId,
       ...startHarnessArgs(this.config), ...(this.config.shareScreen ? ['--display', 'macos'] : ['--no-display']),
-      '-d', '--yes', '--json'], 90_000);
+      '-d', '--yes', '--json'], 90_000, beforeMutation);
     await this.log('start_finished', { ok: start.ok, code: start.code, error: start.ok ? null : redact(start.stderr || start.stdout) });
     const after = await this.probe();
     if (after.kind !== 'healthy') throw new Error(`Startup not verified: ${after.kind}`);
@@ -498,13 +570,27 @@ export class Guard {
     if (compatibility.status !== 'compatible') sample = { kind: 'compatibility_error', error: compatibility.error };
     else {
       try { sample = await this.probe(); }
-      catch (e) { sample = { kind: 'probe_error', error: redact(e.message) }; }
+      catch (e) { sample = { kind: this.networkConfigError ? 'network_config_error' : 'probe_error', error: redact(e.message) }; }
+    }
+    let network;
+    try { network = await this.monitorNetwork(sample, state.network); }
+    catch (error) {
+      const now = Date.now();
+      network = { status: 'blocked', code: 'network_diagnostics_failed', action: 'check_network_diagnostics',
+        error: redact(error.message), since: now, checkedAt: now, nextCheckAt: now + this.config.intervalMs, blockRecovery: true };
     }
     const next = decide(state, sample, Date.now(), paused, this.config);
     next.guardPid = process.pid;
+    next.networkRoute = this.networkRoute ?? 'unknown';
+    next.network = network;
+    if (network.blockRecovery && network.status !== 'not_checked') {
+      next.action = 'observe'; next.reason = network.code; next.candidate = null; next.failureSince = null;
+    }
+    if (network.code !== state.network?.code || network.fingerprint !== state.network?.fingerprint)
+      await this.log('network_status', network);
     next.compatibility = compatibility;
     await this.save(next);
-    await this.log('health', { paused, sample, decision: next.reason });
+    await this.log('health', { paused, sample, decision: next.reason, networkRoute: next.networkRoute });
     if (sample.kind !== 'healthy' && sample.kind !== 'compatibility_error' && sample.kind !== state.sample?.kind)
       await this.snapshot(sample.kind, sample);
     if (this.config.readyHooks && sample.kind === 'healthy' && sample.runtimeId !== state.readyRuntimeId) {
@@ -514,13 +600,29 @@ export class Guard {
       await this.log('ready_hooks', next.lastReadyHooks);
     }
     if (next.action === 'recover') {
+      // An unavailable proxy or account must not consume Runtime restart budgets.
+      try { await this.preflight(); }
+      catch (error) {
+        next.action = 'observe'; next.reason = 'preflight_blocked'; next.candidate = null; next.failureSince = null;
+        next.lastRecovery = { at: new Date().toISOString(), outcome: 'deferred', error: redact(error.message) };
+        await this.log('preflight_blocked', next.lastRecovery);
+        await this.save(next);
+        return next;
+      }
       // Evidence and the rate-limit record must be durable before any destructive action.
       await this.snapshot('before_recovery', sample);
-      next.restarts = [...next.restarts.filter(t => Date.now() - t < 3_600_000), Date.now()];
-      next.lastRecovery = { at: new Date().toISOString(), outcome: 'started' };
+      next.lastRecovery = { at: new Date().toISOString(), outcome: 'preparing' };
       await this.save(next);
-      try { next.lastRecovery = { ...next.lastRecovery, ...await this.recover(sample) }; }
-      catch (e) { next.lastRecovery = { ...next.lastRecovery, outcome: 'failed', error: redact(e.message) }; }
+      let reserved = false;
+      const reserveAttempt = async () => {
+        if (reserved) return;
+        next.restarts = [...next.restarts.filter(t => Date.now() - t < 3_600_000), Date.now()];
+        next.lastRecovery.outcome = 'started';
+        await this.save(next);
+        reserved = true;
+      };
+      try { next.lastRecovery = { ...next.lastRecovery, ...await this.recover(sample, reserveAttempt) }; }
+      catch (e) { next.lastRecovery = { ...next.lastRecovery, outcome: reserved ? 'failed' : 'deferred', error: redact(e.message) }; }
       next.candidate = null;
       next.failureSince = null;
       await this.log('recovery_finished', next.lastRecovery);
@@ -570,7 +672,9 @@ async function main(command, file) {
   }
   if (command === 'check') {
     await guard.preflight();
-    console.log(JSON.stringify({ ...await guard.probe(), compatibility: await guard.checkCompatibility() }, null, 2));
+    const sample = await guard.probe();
+    console.log(JSON.stringify({ ...sample, compatibility: await guard.checkCompatibility(),
+      network: await guard.monitorNetwork(sample, (await guard.loadState()).network) }, null, 2));
     return;
   }
   const unlock = await acquireLock(guard.config.directory);
