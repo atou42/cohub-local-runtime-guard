@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createServer } from 'node:net';
 import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock } from '../guard.mjs';
 
 const base = () => ({ version: 1, restarts: [], checkedAt: null, candidate: null, failureSince: null });
@@ -175,6 +176,104 @@ test('changed consent, invalid CLI package and malformed state fail closed', asy
   await fs.writeFile(g.stateFile, '{broken');
   await assert.rejects(g.loadState(), SyntaxError);
   assert.equal(await fs.readFile(g.stateFile, 'utf8'), '{broken');
+});
+test('explicit shared mode preserves consent on recovery', async t => {
+  assert.equal(CONFIG.codexShared, false);
+  assert.equal(TARGETS['pi-only'].codexShared, false);
+  const g = await fixture(t);
+  g.config = { ...g.config, codexShared: true };
+  const consent = { ...await readJson(g.nativeFile), codexShared: true };
+  await fs.writeFile(g.nativeFile, JSON.stringify(consent));
+  g.sharedServer = async () => ({ state: 'running' });
+  await g.preflight();
+  assert.equal((await g.recover(await g.probe())).outcome, 'recovered');
+  assert.deepEqual(await readJson(g.nativeFile), consent);
+  const calls = await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8');
+  assert.ok(!calls.includes('"daemon"') && !calls.includes('"import"'));
+  await fs.writeFile(g.nativeFile, JSON.stringify({ ...consent, codexShared: false }));
+  await assert.rejects(g.preflight(), /configuration changed/);
+});
+test('shared daemon absence is confirmed before recovery; repair never stops the Runtime or daemon', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, codexShared: true };
+  await fs.writeFile(g.nativeFile, JSON.stringify({ ...await readJson(g.nativeFile), codexShared: true }));
+  await g.cli(['runtime', 'up']);
+  let running = false;
+  g.sharedServer = async () => ({ state: running ? 'running' : 'absent' });
+  const command = g.command.bind(g);
+  const daemonCalls = [];
+  g.command = async (file, args, timeout) => {
+    if (file !== g.config.codex) return command(file, args, timeout);
+    daemonCalls.push(args);
+    running = true;
+    return { ok: true, code: 0, stdout: '', stderr: '' };
+  };
+  const before = await g.probe();
+  assert.equal(before.kind, 'shared_server_down');
+  assert.equal(advance(base(), before, 0, 90).action, 'observe');
+  assert.equal(advance(base(), before, 0, 120).action, 'recover');
+  const result = await g.recover(before);
+  assert.equal(result.outcome, 'recovered');
+  assert.equal((await g.probe()).pid, before.pid);
+  assert.deepEqual(daemonCalls, [['app-server', 'daemon', 'start']]);
+  assert.ok(!(await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).includes('"down"'));
+});
+test('shared daemon invalid socket never authorizes restart', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, codexShared: true };
+  await g.cli(['runtime', 'up']);
+  const socket = path.join(g.config.home, '.codex/app-server-control/app-server-control.sock');
+  await fs.mkdir(path.dirname(socket), { recursive: true });
+  await fs.writeFile(socket, 'not a socket');
+  await assert.rejects(g.sharedServer(), /socket/);
+  const state = await g.tick(base());
+  assert.equal(state.sample.kind, 'probe_error');
+  assert.equal(state.action, 'observe');
+  assert.ok(!(await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).includes('"down"'));
+});
+test('shared daemon probe checks a real socket and rejects failed or malformed version replies', async t => {
+  const g = await fixture(t);
+  assert.deepEqual(await g.sharedServer(), { state: 'absent' });
+  const socket = path.join(g.config.home, '.codex/app-server-control/app-server-control.sock');
+  await fs.mkdir(path.dirname(socket), { recursive: true });
+  const server = createServer(client => client.end());
+  const actualSocket = path.join(g.config.home, 'actual.sock');
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(actualSocket, resolve); });
+  await fs.symlink(actualSocket, socket);
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  g.command = async (file, args) => {
+    assert.equal(file, g.config.codex);
+    assert.deepEqual(args, ['app-server', 'daemon', 'version']);
+    return { ok: true, stdout: JSON.stringify({ status: 'running', socketPath: socket, appServerVersion: '0.163.0' }) };
+  };
+  assert.deepEqual(await g.sharedServer(), { state: 'running', version: '0.163.0' });
+  g.command = async () => ({ ok: false, code: 1, stderr: 'permission denied' });
+  await assert.rejects(g.sharedServer(), /permission denied/);
+  g.command = async () => ({ ok: true, stdout: '{}' });
+  await assert.rejects(g.sharedServer(), /Invalid Codex/);
+  g.command = async () => ({ ok: true, stdout: '{broken' });
+  await assert.rejects(g.sharedServer(), SyntaxError);
+});
+test('shared daemon startup failure is retained and pause prevents any repair', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, codexShared: true };
+  await fs.writeFile(g.nativeFile, JSON.stringify({ ...await readJson(g.nativeFile), codexShared: true }));
+  await g.cli(['runtime', 'up']);
+  g.sharedServer = async () => ({ state: 'absent' });
+  const command = g.command.bind(g);
+  let starts = 0;
+  g.command = async (file, args, timeout) => {
+    if (file !== g.config.codex) return command(file, args, timeout);
+    starts++;
+    return { ok: false, code: 1, stderr: 'daemon locked' };
+  };
+  const before = await g.probe();
+  await assert.rejects(g.recover(before), /start failed/);
+  assert.equal((await g.probe()).pid, before.pid);
+  await fs.writeFile(g.controlFile, JSON.stringify({ version: 1, paused: true }));
+  assert.equal((await g.recover(before)).reason, 'paused');
+  assert.equal(starts, 1);
+  assert.ok(!(await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).includes('"down"'));
 });
 test('replacement Runtime or paused control prevents destructive commands', async t => {
   const g = await fixture(t);
@@ -483,9 +582,13 @@ test('public configuration requires explicit scope and an independent recovery C
   assert.equal(loaded.worker, g.config.worker);
   assert.equal(loaded.shareScreen, false);
   assert.equal(loaded.readyHooks, false);
+  assert.equal(loaded.codexShared, false);
+  await fs.writeFile(file, JSON.stringify({ ...input, codexShared: true }));
+  assert.equal((await loadConfig(file)).codexShared, true);
   await assert.rejects(loadConfig(), /explicit --config/);
   for (const patch of [{ spaceId: CONFIG.spaceId }, { identity: CONFIG.identity }, { root: '~/workspace' },
-    { recoveryCli: input.cli }, { harnesses: ['codex', 'codex'] }, { typo: true }, { shareScreen: 'false' }, { graceMs: 0 }]) {
+    { recoveryCli: input.cli }, { harnesses: ['codex', 'codex'] }, { typo: true }, { shareScreen: 'false' }, { graceMs: 0 },
+    { codexShared: 'true' }, { codexShared: true, harnesses: ['pi'] }]) {
     await fs.writeFile(file, JSON.stringify({ ...input, ...patch }));
     await assert.rejects(loadConfig(file));
   }

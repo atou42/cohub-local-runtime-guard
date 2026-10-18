@@ -7,12 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { lookup } from 'node:dns/promises';
 import os from 'node:os';
+import { createConnection } from 'node:net';
 import { parseArgs } from 'node:util';
 import { resolveNetworkPolicy, probeProxy, assessNetwork, NetworkConfigurationError } from './network-env.mjs';
 
 export const CONFIG = Object.freeze({
   home: os.homedir(),
   harnesses: ['codex', 'pi'],
+  codexShared: false,
   spaceId: 'example-space',
   identity: 'prod:example-user',
   node: process.execPath,
@@ -60,7 +62,7 @@ export async function loadConfig(file) {
   const input = await readJson(path.resolve(file));
   if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Invalid guard configuration');
   const fields = ['home', 'root', 'spaceId', 'identity', 'node', 'cli', 'recoveryCli', 'compatibilityFile',
-    'directory', 'harnesses', 'codex', 'pi', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
+    'directory', 'harnesses', 'codex', 'pi', 'codexShared', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
     'unhealthyMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'];
   for (const key of Object.keys(input)) if (!fields.includes(key)) throw new Error(`Unknown configuration field: ${key}`);
   for (const key of ['root', 'spaceId', 'identity', 'cli', 'recoveryCli', 'compatibilityFile', 'directory', 'harnesses'])
@@ -82,8 +84,10 @@ export async function loadConfig(file) {
   try { installedPath = await fs.realpath(config.cli); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (installedPath === recoveryPath) throw new Error('The recovery CLI must not link to the global installation');
-  for (const key of ['shareScreen', 'readyHooks'])
+  for (const key of ['codexShared', 'shareScreen', 'readyHooks'])
     if (typeof config[key] !== 'boolean') throw new Error(`Configuration field ${key} must be boolean`);
+  if (config.codexShared && !config.harnesses.includes('codex'))
+    throw new Error('Shared Codex control requires the codex harness');
   if (config.shareScreen && process.platform !== 'darwin') throw new Error('Screen sharing is supported only on macOS');
   for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'])
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`Configuration field ${key} must be a positive integer`);
@@ -218,7 +222,7 @@ export function startHarnessArgs(config) {
 
 export function decide(previous, sample, now, paused, config = CONFIG) {
   const next = { ...previous, checkedAt: now, sample, paused };
-  const recoverable = ['process_down', 'connection_stuck'].includes(sample.kind);
+  const recoverable = ['process_down', 'connection_stuck', 'shared_server_down'].includes(sample.kind);
   const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}` : null;
   const gap = previous.checkedAt !== null && (now - previous.checkedAt > config.intervalMs * 3 || now < previous.checkedAt);
   if (!key || paused) { next.candidate = null; next.failureSince = null; }
@@ -341,7 +345,40 @@ export class Guard {
     const result = await this.cli(['runtime', 'status', '--space', this.config.spaceId, '--json'], this.config.probeTimeoutMs);
     if (!result.ok && result.killed) throw new Error(`Runtime probe timed out after ${this.config.probeTimeoutMs} ms`);
     if (!result.ok) throw new Error(`Runtime probe failed: ${redact(result.stderr || result.stdout || String(result.code))}`);
-    return summarizeStatus(JSON.parse(result.stdout), this.config);
+    const sample = summarizeStatus(JSON.parse(result.stdout), this.config);
+    if (this.config.codexShared && ['healthy', 'connection_stuck', 'process_down'].includes(sample.kind)) {
+      sample.sharedServer = await this.sharedServer();
+      if (sample.kind === 'healthy' && sample.sharedServer.state === 'absent') sample.kind = 'shared_server_down';
+    }
+    return sample;
+  }
+  async sharedServer() {
+    const socketPath = path.join(this.config.home, '.codex/app-server-control/app-server-control.sock');
+    let info;
+    let resolvedSocket;
+    // Codex publishes a symlink to its short socket path under /private/tmp.
+    try { resolvedSocket = await fs.realpath(socketPath); info = await fs.stat(resolvedSocket); }
+    catch (error) { if (error.code === 'ENOENT') return { state: 'absent' }; throw error; }
+    if (!info.isSocket()) throw new Error('Codex shared control path is not a socket; retained');
+    if (info.uid !== process.getuid()) throw new Error('Codex shared socket owner changed; retained');
+    const connected = await new Promise((resolve, reject) => {
+      const socket = createConnection(resolvedSocket);
+      socket.setTimeout(3000);
+      socket.once('connect', () => { socket.destroy(); resolve(true); });
+      socket.once('timeout', () => socket.destroy(new Error('Codex shared socket probe timed out')));
+      socket.once('error', error => {
+        socket.destroy();
+        if (['ENOENT', 'ECONNREFUSED'].includes(error.code)) resolve(false);
+        else reject(error);
+      });
+    });
+    if (!connected) return { state: 'absent' };
+    const result = await this.command(this.config.codex, ['app-server', 'daemon', 'version'], 10_000);
+    if (!result.ok) throw new Error(`Codex shared probe failed: ${redact(result.stderr || String(result.code))}`);
+    const status = JSON.parse(result.stdout);
+    if (status.status !== 'running' || status.socketPath !== socketPath || typeof status.appServerVersion !== 'string')
+      throw new Error('Invalid Codex shared daemon status');
+    return { state: 'running', version: status.appServerVersion };
   }
   async paused() {
     const control = await readJson(this.controlFile, true);
@@ -393,7 +430,8 @@ export class Guard {
     await this.checkCompatibility();
     const native = await readJson(this.nativeFile);
     if (native.version !== 2 || native.identity !== this.config.identity || native.spaceId !== this.config.spaceId ||
-        native.root !== rootOf(this.config) || !sameHarnesses(native.harnesses, this.config) || native.codexShared !== false ||
+        native.root !== rootOf(this.config) || !sameHarnesses(native.harnesses, this.config) ||
+        typeof this.config.codexShared !== 'boolean' || native.codexShared !== this.config.codexShared ||
         !Number.isFinite(Date.parse(native.enabledAt))) throw new Error('Native consent/configuration changed; refusing unattended startup');
     const bindings = await readJson(path.join(this.config.home, '.config/cohub/runtime-spaces.json'));
     if (bindings.version !== 1 || !Array.isArray(bindings.bindings) ||
@@ -482,6 +520,25 @@ export class Guard {
     const fresh = await this.probe();
     if (fresh.kind !== sample.kind || fresh.pid !== sample.pid || fresh.runtimeId !== sample.runtimeId)
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
+    if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
+      // Start is idempotent. Never stop or restart a daemon shared with other clients.
+      await this.refreshNetworkEnvironment();
+      await this.preflight();
+      if (await this.paused()) return { outcome: 'skipped', reason: 'paused' };
+      if ((await this.sharedServer()).state === 'absent') {
+        if (beforeMutation) await beforeMutation();
+        const started = await this.command(this.config.codex, ['app-server', 'daemon', 'start'], 35_000);
+        await this.log('shared_server_start', { ok: started.ok, code: started.code,
+          error: started.ok ? null : redact(started.stderr || started.stdout) });
+        if (!started.ok) throw new Error('Codex shared daemon start failed; retained existing state');
+      }
+      if ((await this.sharedServer()).state !== 'running') throw new Error('Codex shared daemon startup not verified');
+    }
+    if (sample.kind === 'shared_server_down') {
+      const after = await this.probe();
+      if (after.kind !== 'healthy') throw new Error(`Shared daemon recovery not verified: ${after.kind}`);
+      return { outcome: 'recovered', pid: after.pid, runtimeId: after.runtimeId, component: 'shared_app_server' };
+    }
     const owner = await this.owner();
     if (sample.pid) {
       if (!owner || owner.pid !== sample.pid) throw new Error('Runtime ownership changed before stop');

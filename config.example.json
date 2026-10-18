@@ -9,6 +9,7 @@
   "compatibilityFile": "/absolute/path/to/guard-baseline.json",
   "directory": "/absolute/path/to/private/guard-state",
   "harnesses": ["codex", "pi"],
+  "codexShared": false,
   "codex": "/absolute/path/to/codex",
   "pi": "/absolute/path/to/pi",
   "shareScreen": false,

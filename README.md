@@ -21,7 +21,7 @@ The production watchdog has been exercised on macOS. The synthetic process tests
 
 ## Setup
 
-Start and authorize your Runtime using Cohub's normal interactive workflow first. This guard must not be used to grant new synchronization, execution or screen-sharing consent. It deliberately requires the existing native configuration to have `codexShared: false`; shared Codex control is not supported by this version.
+Start and authorize your Runtime using Cohub's normal interactive workflow first. This guard must not be used to grant new synchronization, execution, shared Codex control or screen-sharing consent. Set `codexShared` to match the existing native configuration exactly. It defaults to `false` for existing private-control setups; set it to `true` only after shared control has already been authorized in Cohub. Enabling it also requires the `codex` harness.
 
 1. Clone this repository and run `npm test`.
 2. Review the installed Cohub CLI that you intend to use for recovery. Do not acknowledge unknown code only to clear a warning.
@@ -52,6 +52,14 @@ node guard.mjs run --config ./config.local.json
 ```
 
 Screen sharing and workspace-ready hooks are **off by default**. Set `shareScreen: true` only on macOS and only after explicitly authorizing desktop viewing/control in Cohub. When restarting, the guard applies this configured display choice. Align it with your existing authorization.
+
+## Shared Codex App Server
+
+With `codexShared: true`, each monitor cycle also checks the configured home's `.codex/app-server-control/app-server-control.sock` and validates `codex app-server daemon version`. The socket may be a symlink to Codex's short socket path; its target must be a socket owned by the current user. This interface was checked with Codex 0.163.0 on macOS. Custom `CODEX_HOME` layouts are not supported by this guard.
+
+If the socket is missing or refuses connections for two continuously observed minutes, the guard calls the idempotent `codex app-server daemon start` and verifies the result. This shares the normal pause, cooldown and hourly recovery limits. Recovering only the shared daemon does not stop an otherwise healthy Runtime. When the Runtime itself needs recovery, its already-running shared app-server is preserved.
+
+The guard never stops, restarts or upgrades the shared daemon, changes provider/model settings, replays prompts or imports history. Permission errors, timeouts, malformed replies, ownership changes and non-socket control paths remain visible failures; they do not authorize cleanup or forced restarts. A hung but still-present shared daemon therefore needs investigation rather than automatic termination.
 
 ## Commands
 
@@ -124,7 +132,7 @@ Optional `readyHooks: true` dispatches existing `.cohub/hooks/*.json` workspace-
 npm test
 ```
 
-Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies and TLS servers; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery.
+Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery.
 
 ## License
 
