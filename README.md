@@ -81,6 +81,26 @@ For installations migrating from the original local Chinese-named guard, `stateL
 
 The guard always executes the reviewed copy. `compatibility.version` is that recovery version; `installedVersion` is the global CLI version when readable. A global code/dependency change sets `upgradeStatus: review_required`; a partial or missing install sets `upgradeStatus: unavailable`. Both are informational and monitoring/recovery continues through the reviewed copy.
 
+### Preserve The Reviewed Dependency Lock
+
+Do not repeat `npm install -g @neta-art/cohub-cli@VERSION` or install its tarball globally after reviewing a candidate. Those commands can resolve dependency ranges again. For example, CLI 10.6.0 declares `@neta-art/generation: ^0.1.39`: a candidate can contain 0.1.39 while a later global install contains 0.1.40, even though both CLI tarballs have the same integrity. This is a genuine change to the reviewed dependency set.
+
+Keep the dedicated review project's `package.json`, `package-lock.json`, any referenced local CLI tarball, and the complete reviewed candidate. The project must have only the CLI as its direct dependency. Lockfile versions 2 and 3 are supported; package entries must have SHA-512 integrity and an npm registry URL, except the CLI may reference an adjacent `file:../...tgz`.
+
+To update an **existing** global package from that exact reviewed lock:
+
+```sh
+node scripts/install-locked-cli.mjs \
+  --project /absolute/path/to/review-project \
+  --reviewed-cli /absolute/path/to/reviewed-candidate/bin/cohub.js \
+  --destination /absolute/path/to/global/node_modules/@neta-art/cohub-cli \
+  --ack-reviewed
+```
+
+The helper runs `npm ci --ignore-scripts` in an isolated sibling of the review project, preserving relative tarball references and leaving the original project untouched. It prepares a self-contained package, checks the version fingerprint **and all package-file bytes** against the reviewed candidate, then replaces the global package directory while retaining the previous installation as a backup. Only npm-generated top-level dependency bin links and the hidden lock record are excluded from the byte comparison. Dependency layouts that would overwrite nested packages are rejected, not silently rearranged. An unavailable locked dependency, integrity error, changed candidate or changed destination aborts installation and retains evidence.
+
+The existing global executable link remains in place; this helper does not create a new global installation. It never executes Cohub, changes a compatibility baseline or configuration, or stops/restarts a guard, Runtime or shared daemon. Installing the global package is separate from activating it for recovery. Do not use a new lockfile or change the reviewed candidate just to bypass a mismatch.
+
 Only a damaged reviewed copy or baseline blocks recovery. This protection is not bypassed. To adopt a newer CLI, review and test it, create a new snapshot and baseline at new paths, pause/stop the guard, update its configuration, run `check`, then restart and resume the guard. Do not modify a reviewed copy in place or regenerate a fingerprint merely to silence an error. The guard does not auto-upgrade Cohub, automatically review releases, or promise indefinite compatibility with server changes.
 
 New snapshots use baseline schema 2: an exact reviewed version and source/dependency-version fingerprint, plus a passing `cohub-runtime-guard/v2` behavioral record. Future versions can be adopted through the same verifier instead of editing a version allowlist. An interface change or failed check blocks publication of the new baseline and retains isolated evidence; it does not disable the old reviewed copy. Existing schema 1 baselines retain their original fingerprint-only semantics.
@@ -147,7 +167,7 @@ Optional `readyHooks: true` dispatches existing `.cohub/hooks/*.json` workspace-
 npm test
 ```
 
-Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes active-execution `1006` fast recovery with one replacement worker and no prompt replay, rejection of stale/foreign/fatal/recovered diagnostics, schema 2 verification failures, legacy state preservation, shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery. Run the separate candidate verifier above against each reviewed CLI release; `npm test` does not require an installed Cohub CLI.
+Tests use temporary directories, synthetic CLI replies and isolated Node workers. Locked-install tests use `tar` and real offline `npm ci` with a private synthetic package cache; they check exact dependency restoration, disabled install hooks, byte-level mismatch rejection, failed installs and publication rollback. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes active-execution `1006` fast recovery with one replacement worker and no prompt replay, rejection of stale/foreign/fatal/recovered diagnostics, schema 2 verification failures, legacy state preservation, shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery. Run the separate candidate verifier above against each reviewed CLI release; `npm test` does not require an installed Cohub CLI.
 
 ## License
 
