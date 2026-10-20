@@ -32,7 +32,7 @@ if (args[0] === 'network-env') {
     pid: o.pid, runtimeId: o.runtimeId, root: setup.root ?? home, spaceId: setup.spaceId,
     harnesses: setup.harnesses ?? ['codex', 'pi'], state: healthy ? 'ready' : 'reconnecting',
     harnessConnected: !!healthy, workspaceConnected: !!healthy,
-  } : null, remote: { online: !!healthy, runtimeId: healthy ? o.runtimeId : null, workspace: { online: !!healthy } },
+  } : null, remote: setup.remote ?? { online: !!healthy, runtimeId: healthy ? o.runtimeId : null, workspace: { online: !!healthy } },
   remoteError: null, nativeSyncError: null, pendingLocalArchives: 0 });
 } else if (args[1] === 'down') {
   const o = await owner();
@@ -43,6 +43,10 @@ if (args[0] === 'network-env') {
     emit({ stopped: !alive(o.pid) });
   } else emit({ stopped: true });
 } else if (args[1] === 'up') {
+  if (setup.failStart) {
+    console.error('Synthetic start failure');
+    process.exit(1);
+  }
   const o = await owner();
   if (o && alive(o.pid)) throw new Error('Duplicate Runtime');
   const child = spawn(process.execPath, [setup.worker], { detached: true, stdio: 'ignore', env: { HOME: home } });

@@ -119,6 +119,15 @@ async function fixture(t, target = CONFIG, rootName = null) {
   const here = path.dirname(fileURLToPath(import.meta.url));
   await fs.copyFile(path.join(here, 'fixtures/cli.mjs'), config.cli);
   await fs.copyFile(path.join(here, 'fixtures/worker.mjs'), config.worker);
+  await fs.writeFile(path.join(dir, 'dist/client.js'), `
+    import fs from 'node:fs/promises';
+    export function createClient() { return { space(spaceId) { return { sandbox: { async get() {
+      const setup = JSON.parse(await fs.readFile(process.env.HOME + '/fixture.json', 'utf8'));
+      if (spaceId !== setup.spaceId) throw new Error('Wrong Space');
+      if (setup.remoteRecordFailure) throw new Error('Bearer PRIVATE_TOKEN');
+      return { sandbox: setup.remoteRecord ?? null };
+    } } }; } }; }
+  `);
   await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: '@neta-art/cohub-cli', type: 'module', version: '10.0.0' }));
   await fs.mkdir(path.join(dir, 'dist/commands'), { recursive: true });
   for (const name of ['runtime', 'auth', 'run']) await fs.writeFile(path.join(dir, 'dist/commands', `${name}.js`), '');
@@ -790,4 +799,430 @@ test('a proxy change immediately before stop defers recovery without consuming b
   assert.deepEqual(result.restarts, []);
   assert.ok(await g.processIdentity(owner.pid));
   assert.ok((await calls(g)).every(args => !args.includes('down')));
+});
+
+const disconnectedRecord = now => ({
+  provider: 'local', status: 'stopped', runtimeStatus: 'stopped',
+  stopReason: 'disconnected', lastHeartbeatAt: new Date(now - 180_000).toISOString(),
+});
+const staleOffline = now => ({
+  ...failed, online: false, remoteRuntimeId: 'runtime-a', remoteWorkspaceOnline: false,
+  remoteRecord: disconnectedRecord(now),
+});
+
+test('remote instance identity and observation time survive status projection', () => {
+  const raw = rawStatus();
+  raw.remote.observedAt = '2026-10-20T09:35:00.000Z';
+  const sample = summarizeStatus(raw);
+  assert.equal(sample.remoteRuntimeId, 'runtime-a');
+  assert.equal(sample.remoteWorkspaceOnline, true);
+  assert.equal(sample.remoteObservedAt, raw.remote.observedAt);
+  raw.remote.online = false;
+  raw.remote.runtimeId = 42;
+  assert.throws(() => summarizeStatus(raw), /remote Runtime/);
+});
+
+test('10-20: stopped worker waits for its old lease then resumes without cooldown or a second budget charge', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
+  g.remoteRecord = async () => null;
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true });
+  const old = await g.probe();
+  const invoke = g.cli.bind(g);
+  g.cli = async (args, timeout, beforeExecute) => {
+    const result = await invoke(args, timeout, beforeExecute);
+    if (args[1] === 'down') await setFixture(g, {
+      remote: { online: true, runtimeId: old.runtimeId, workspace: { online: false } },
+    });
+    return result;
+  };
+  let state = await g.tick(base());
+  assert.equal(state.pendingRecovery.phase, 'awaiting_start');
+  assert.equal(state.restarts.length, 1);
+  assert.equal(state.lastRecovery.reason, 'waiting_previous_lease');
+  const operationId = state.pendingRecovery.id;
+  state = await g.tick(await g.loadState());
+  assert.equal(state.reason, 'waiting_previous_lease');
+  assert.equal(state.pendingRecovery.id, operationId);
+  await setFixture(g, { remote: null });
+  state.pendingRecovery.nextAttemptAt = Date.now() - 1;
+  state = await g.tick(state);
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal(state.restarts.length, 1);
+  assert.equal(state.pendingRecovery, null);
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+test('10-20: exhausted normal budget has a slower stale-disconnect escalation, not an unconditional override', () => {
+  const now = Date.parse('2026-10-20T09:35:37Z');
+  const restarts = ['08:56:25.321', '09:10:03.193', '09:20:18.574'].map(s => Date.parse(`2026-10-20T${s}Z`));
+  const sample = { ...staleOffline(now), transportFailure: { code: 1006, activeExecutions: 1, closedAt: now - 32_000 } };
+  const first = decide({ ...base(), restarts }, sample, now - 25_000, false, CONFIG);
+  const state = decide(first, sample, now, false, CONFIG);
+  assert.equal(state.action, 'recover');
+  assert.equal(state.reason, 'stale_disconnect_escalation');
+  const again = decide({ ...state, lastEscalationAt: now }, sample, now + 10_000, false, CONFIG);
+  assert.equal(again.action, 'observe');
+  assert.equal(again.nextEligibleAt, now + CONFIG.escalationIntervalMs);
+  for (const patch of [
+    { remoteRuntimeId: 'genuine-other' },
+    { remoteWorkspaceOnline: true },
+    { online: true },
+    { remoteRecord: { ...sample.remoteRecord, provider: 'cloud' } },
+    { remoteRecord: { ...sample.remoteRecord, status: 'running' } },
+    { remoteRecord: { ...sample.remoteRecord, stopReason: 'user' } },
+    { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: new Date(now).toISOString() } },
+    { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: 'broken' } },
+    { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: null } },
+    { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: new Date(now + 1000).toISOString() } },
+  ]) assert.equal(decide(first, { ...sample, ...patch }, now, false, CONFIG).action, 'observe');
+});
+
+const reopenGuard = g => Object.assign(new Guard(g.config), {
+  systemProxyReader: g.systemProxyReader, networkSourceEnv: {}, proxyProbe: g.proxyProbe,
+  network: g.network, now: g.now, notify: () => {},
+});
+
+test('remote lifecycle probe uses the reviewed client, projects only safe fields and exposes failures', async t => {
+  const g = await fixture(t);
+  const now = Date.now();
+  const record = { ...disconnectedRecord(now), meta: { token: 'PRIVATE_TOKEN' }, secret: 'PRIVATE_SECRET' };
+  await setFixture(g, { remoteRecord: record });
+  assert.deepEqual(await g.remoteRecord(), disconnectedRecord(now));
+  assert.equal((await g.probe()).remoteRecord.lastHeartbeatAt, record.lastHeartbeatAt);
+  await setFixture(g, { remoteRecord: { ...record, lastHeartbeatAt: 42 } });
+  assert.match((await g.probe()).remoteEvidenceError, /lifecycle probe failed/);
+  await setFixture(g, { remoteRecordFailure: true });
+  const sample = await g.probe();
+  assert.equal(sample.kind, 'process_down');
+  assert.equal(sample.remoteRecord, undefined);
+  assert.ok(!JSON.stringify(sample).includes('PRIVATE_TOKEN'));
+});
+
+test('pending stop survives a guard interruption and completion is charged once', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
+  let clock = Date.now();
+  g.now = () => clock;
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true });
+  const invoke = g.cli.bind(g);
+  g.cli = async (args, timeout, beforeExecute) => {
+    const result = await invoke(args, timeout, beforeExecute);
+    if (args[1] === 'down') throw new Error('Simulated guard interruption after stop');
+    return result;
+  };
+  let state = await g.tick(base());
+  assert.equal(state.pendingRecovery.phase, 'stopping');
+  const id = state.pendingRecovery.id;
+  assert.equal(await g.processIdentity(state.pendingRecovery.sourcePid), null);
+  const restarted = reopenGuard(g);
+  clock += CONFIG.resumeRetryMs;
+  state = await restarted.tick(await restarted.loadState());
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal(state.lastRecovery.operationId, id);
+  assert.equal(state.pendingRecovery, null);
+  assert.equal(state.restarts.length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+test('a real competing remote instance is never replaced, even during a pending recovery', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
+  g.notify = () => {};
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true });
+  const invoke = g.cli.bind(g);
+  g.cli = async (args, timeout, beforeExecute) => {
+    const result = await invoke(args, timeout, beforeExecute);
+    if (args[1] === 'down') await setFixture(g, { remote: {
+      online: true, runtimeId: 'genuine-competitor', workspace: { online: true },
+    } });
+    return result;
+  };
+  let state = await g.tick(base());
+  assert.equal(state.lastRecovery.reason, 'recovery_conflict');
+  state = await g.tick(await g.loadState());
+  assert.equal(state.reason, 'recovery_conflict');
+  assert.equal(state.restarts.length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
+  const events = (await fs.readFile(g.logFile, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.find(e => e.event === 'startup_probe').sample.remoteRuntimeId, 'genuine-competitor');
+});
+
+test('pending recovery retains scope and process identity checks across restarts', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true });
+  const invoke = g.cli.bind(g);
+  g.cli = async (args, timeout, beforeExecute) => {
+    if (args[1] === 'down') {
+      await beforeExecute();
+      throw new Error('Synthetic interruption before stop');
+    }
+    return invoke(args, timeout, beforeExecute);
+  };
+  let state = await g.tick(base());
+  const old = await g.owner();
+  const restarted = reopenGuard(g);
+  restarted.now = () => state.pendingRecovery.nextAttemptAt;
+  await fs.writeFile(g.ownerFile, JSON.stringify({ ...old, nonce: 'changed-owner' }));
+  state = await restarted.tick(await restarted.loadState());
+  assert.match(state.lastRecovery.error, /process identity changed/);
+  assert.ok(await g.processIdentity(old.pid));
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+  const wrongScope = reopenGuard(g);
+  wrongScope.config = { ...wrongScope.config, spaceId: 'another-space' };
+  const preserved = await fs.readFile(g.stateFile, 'utf8');
+  await assert.rejects(wrongScope.tick(await wrongScope.loadState()), /scope changed/);
+  assert.equal(await fs.readFile(g.stateFile, 'utf8'), preserved);
+});
+
+test('pause, unavailable proxy and failed consent preserve the pending operation without mutation', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  g.config = { ...g.config, unhealthyMs: 0 };
+  await setFixture(g, { failStart: true });
+  let state = await g.tick(base());
+  const pendingId = state.pendingRecovery.id;
+  clock += CONFIG.resumeRetryMs;
+  await fs.writeFile(g.controlFile, JSON.stringify({ version: 1, paused: true }));
+  state = await g.tick(state);
+  assert.equal(state.reason, 'paused');
+  await fs.writeFile(g.controlFile, JSON.stringify({ version: 1, paused: false }));
+  g.networkSourceEnv = { HTTPS_PROXY: 'http://127.0.0.1:7893' };
+  g.proxyProbe = async endpoint => ({ ...endpoint, ok: false, code: 'proxy_refused' });
+  state = await g.tick(state);
+  assert.equal(state.reason, 'proxy_refused');
+  g.networkSourceEnv = {};
+  const consent = await readJson(g.nativeFile);
+  await fs.writeFile(g.nativeFile, JSON.stringify({ ...consent, enabledAt: null }));
+  state = await g.tick(state);
+  assert.equal(state.lastRecovery.outcome, 'deferred');
+  assert.equal(state.pendingRecovery.id, pendingId);
+  assert.equal(state.pendingRecovery.attempts, 1);
+  assert.equal(state.restarts.length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
+});
+
+test('failed starts have bounded same-operation retries, then spaced and revalidated escalations', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  g.notify = () => {};
+  g.config = { ...g.config, unhealthyMs: 0 };
+  await setFixture(g, { failStart: true, remoteRecord: disconnectedRecord(clock) });
+  let state = await g.tick(base());
+  const id = state.pendingRecovery.id;
+  for (let i = 0; i < 2; i++) {
+    clock += CONFIG.resumeRetryMs;
+    state = await g.tick(await g.loadState());
+  }
+  assert.equal(state.pendingRecovery.attempts, 3);
+  assert.equal(state.pendingRecovery.id, id);
+  assert.equal(state.restarts.length, 1);
+  clock += CONFIG.resumeRetryMs;
+  state = await g.tick(state);
+  assert.equal(state.action, 'observe');
+  assert.equal(state.reason, 'resume_retry_limited');
+  clock = state.nextEligibleAt;
+  state = await g.tick(await g.loadState());
+  assert.equal(state.pendingRecovery.attempts, 4);
+  assert.equal(state.restarts.length, 1);
+  assert.equal(state.lastEscalationAt, clock);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 4);
+  clock += CONFIG.resumeRetryMs;
+  state = await reopenGuard(g).tick(await g.loadState());
+  assert.equal(state.action, 'observe');
+  assert.equal(state.nextEligibleAt, state.lastEscalationAt + CONFIG.escalationIntervalMs);
+});
+
+test('escalation rechecks heartbeat and identity immediately before any destructive command', async t => {
+  const g = await fixture(t);
+  const now = Date.now();
+  g.now = () => now;
+  g.config = { ...g.config, unhealthyMs: 0 };
+  const old = staleOffline(now);
+  const state = { ...base(), restarts: [now - 2_000_000, now - 1_500_000, now - 1_000_000] };
+  let count = 0;
+  g.probe = async () => ++count === 1 ? old : {
+    ...old, remoteRecord: { ...old.remoteRecord, lastHeartbeatAt: new Date(now).toISOString() },
+  };
+  const after = await g.tick(state);
+  assert.equal(after.lastRecovery.outcome, 'skipped');
+  assert.match(after.lastRecovery.reason, /evidence changed/);
+  assert.deepEqual(after.restarts, state.restarts);
+  assert.equal(after.lastEscalationAt, undefined);
+  assert.ok((await calls(g)).every(a => !['down', 'up'].includes(a[1])));
+});
+
+test('an escalation that starts a replacement persists its budget and survives guard restart', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, remoteRecord: disconnectedRecord(clock) });
+  const before = await g.probe();
+  let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000] });
+  assert.equal(state.lastRecovery.mode, 'escalated');
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal(state.restarts.length, 4);
+  assert.equal(state.lastEscalationAt, clock);
+  assert.equal(await g.processIdentity(before.pid), null);
+  await setFixture(g, { stuck: true });
+  clock += CONFIG.cooldownMs + 1;
+  state = await reopenGuard(g).tick(await g.loadState());
+  assert.equal(state.action, 'observe');
+  assert.equal(state.reason, 'escalation_cooldown');
+});
+
+test('a successful startup followed by an unavailable probe does not cause a duplicate startup', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, unhealthyMs: 0 };
+  const invoke = g.cli.bind(g);
+  const probe = g.probe.bind(g);
+  let started = false;
+  g.cli = async (args, timeout, beforeExecute) => {
+    const result = await invoke(args, timeout, beforeExecute);
+    if (args[1] === 'up') started = true;
+    return result;
+  };
+  g.probe = async () => {
+    if (started) throw new Error('Synthetic post-start status timeout');
+    return probe();
+  };
+  let state = await g.tick(base());
+  assert.equal(state.pendingRecovery.phase, 'starting');
+  state = await reopenGuard(g).tick(await g.loadState());
+  assert.equal(state.pendingRecovery, null);
+  assert.equal(state.lastRecovery.outcome, 'observed_healthy');
+  assert.equal(state.restarts.length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
+});
+
+test('malformed recovery journals are retained and never reset into a new budget', async t => {
+  const g = await fixture(t);
+  for (const bad of [
+    { pendingRecovery: { phase: 'awaiting_start' } },
+    { lastEscalationAt: 'yesterday' },
+    { lastNotice: { key: 'rate_limited', at: null } },
+  ]) {
+    const text = JSON.stringify({ ...base(), ...bad });
+    await fs.writeFile(g.stateFile, text);
+    await assert.rejects(g.loadState(), /Invalid recovery journal/);
+    assert.equal(await fs.readFile(g.stateFile, 'utf8'), text);
+  }
+});
+
+test('limit notices include retry time and survive restarts without notifying on every poll', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  g.config = { ...g.config, unhealthyMs: 0 };
+  const sample = { ...failed, online: false, remoteRuntimeId: 'runtime-a', remoteWorkspaceOnline: false };
+  g.probe = async () => sample;
+  const notices = [];
+  g.notify = n => notices.push(n);
+  let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000] });
+  assert.equal(state.reason, 'rate_limited');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].nextEligibleAt, state.restarts[0] + 3_600_000);
+  assert.equal(notices[0].remoteRuntimeId, 'runtime-a');
+  clock += CONFIG.intervalMs;
+  state = await g.tick(await g.loadState());
+  assert.equal(notices.length, 1);
+  clock += CONFIG.escalationIntervalMs;
+  state = await g.tick({ ...await g.loadState(), checkedAt: clock - CONFIG.intervalMs });
+  assert.equal(notices.length, 2);
+});
+
+test('10-20 timeline replay: fixing split accounting leaves room for the 17:35 fast recovery', () => {
+  const at = time => Date.parse(`2026-10-20T${time}+08:00`);
+  let state = base();
+  const sample = { ...failed, transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('16:55:41') } };
+  state = advance(state, sample, at('16:55:53'), at('16:56:13'), false, CONFIG);
+  assert.equal(state.action, 'recover');
+  state = { ...state, restarts: [at('16:56:25')], pendingRecovery: null };
+  state = decide(state, { kind: 'healthy' }, at('16:56:42'), false, CONFIG);
+  const bridgeLost = { ...failed, pid: 301, runtimeId: 'runtime-b' };
+  state = advance(state, bridgeLost, at('17:07:47'), at('17:09:57'), false, CONFIG);
+  assert.equal(state.action, 'recover');
+  // The integration test above exercises the real stop/old-lease/resume sequence.
+  state.restarts.push(at('17:10:03'));
+  state = decide(state, { kind: 'healthy' }, at('17:10:30'), false, CONFIG);
+  assert.equal(state.restarts.length, 2);
+  const latest = { ...sample, pid: 302, runtimeId: 'runtime-c',
+    transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('17:35:05') } };
+  state = advance(state, latest, at('17:35:13'), at('17:35:33'), false, CONFIG);
+  assert.equal(state.action, 'recover');
+  assert.equal(state.recoveryMode, 'normal');
+});
+
+test('18:20 regression: a defunct ps command after forced stop does not abort replacement startup', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, refuseStop: true });
+  const sample = await g.probe();
+  const command = g.command.bind(g);
+  const log = g.log.bind(g);
+  let killed = false, zombieObserved = false;
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'forced_stop') killed = true;
+  };
+  g.command = async (file, args, timeout) => {
+    if (killed && !zombieObserved && file === '/bin/ps' && args[1] === String(sample.pid)) {
+      if (args.at(-1) === 'stat=') {
+        zombieObserved = true;
+        return { ok: true, stdout: 'Z\n', stderr: '', code: 0 };
+      }
+      return { ok: true, stdout: `${process.getuid()} Tue Oct 20 18:00:00 2026 <defunct>\n`, stderr: '', code: 0 };
+    }
+    return command(file, args, timeout);
+  };
+  const result = await g.recover(sample);
+  assert.equal(zombieObserved, true);
+  assert.equal(result.outcome, 'recovered');
+  assert.notEqual(result.pid, sample.pid);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+test('18:20 regression: a verified replacement appearing after kill is adopted, not killed or duplicated', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, refuseStop: true });
+  const sample = await g.probe();
+  const log = g.log.bind(g);
+  let replacementPid;
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'forced_stop') {
+      for (let n = 0; n < 100 && await g.processIdentity(sample.pid); n++)
+        await new Promise(r => setTimeout(r, 10));
+      await g.cli(['runtime', 'up']);
+      replacementPid = (await g.owner()).pid;
+    }
+  };
+  const result = await g.recover(sample);
+  assert.equal(result.outcome, 'recovered');
+  assert.equal(result.reason, 'replacement_adopted');
+  assert.equal(result.pid, replacementPid);
+  assert.ok(await g.processIdentity(replacementPid));
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+test('post-kill identity rechecks distinguish reused PIDs from inspection failures', async t => {
+  const g = await fixture(t);
+  g.command = async (_file, args) => ({ ok: true, code: 0, stderr: '',
+    stdout: args.at(-1) === 'stat=' ? 'S\n' : `${process.getuid()} Tue Oct 20 18:00:00 2026 /unrelated/program\n` });
+  await assert.rejects(g.processIdentity(123), /approved Runtime worker/);
+  assert.equal(await g.originalProcessAlive(123, 'original-worker'), false);
+  g.command = async () => ({ ok: false, code: 2, stdout: '', stderr: 'Permission denied' });
+  await assert.rejects(g.originalProcessAlive(123, 'original-worker'), /Cannot inspect/);
 });

@@ -32,6 +32,10 @@ export const CONFIG = Object.freeze({
   executionDisconnectMs: 20_000,
   cooldownMs: 600_000,
   maxRestartsPerHour: 3,
+  resumeRetryMs: 30_000,
+  maxResumeAttempts: 3,
+  escalationIntervalMs: 900_000,
+  staleHeartbeatMs: 120_000,
   graceMs: 30_000,
   // Optional: dispatch existing workspace-ready JSON hooks once per Runtime instance.
   readyHooks: false,
@@ -65,7 +69,8 @@ export async function loadConfig(file) {
   if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Invalid guard configuration');
   const fields = ['home', 'root', 'spaceId', 'identity', 'node', 'cli', 'recoveryCli', 'compatibilityFile',
     'directory', 'harnesses', 'codex', 'pi', 'codexShared', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
-    'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs', 'stateLayout'];
+    'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs', 'stateLayout',
+    'resumeRetryMs', 'maxResumeAttempts', 'escalationIntervalMs', 'staleHeartbeatMs'];
   for (const key of Object.keys(input)) if (!fields.includes(key)) throw new Error(`Unknown configuration field: ${key}`);
   for (const key of ['root', 'spaceId', 'identity', 'cli', 'recoveryCli', 'compatibilityFile', 'directory', 'harnesses'])
     if (!Object.hasOwn(input, key)) throw new Error(`Missing configuration field: ${key}`);
@@ -92,8 +97,11 @@ export async function loadConfig(file) {
     throw new Error('Shared Codex control requires the codex harness');
   if (config.shareScreen && process.platform !== 'darwin') throw new Error('Screen sharing is supported only on macOS');
   stateNames(config.stateLayout);
-  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'])
+  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs',
+    'resumeRetryMs', 'maxResumeAttempts', 'escalationIntervalMs', 'staleHeartbeatMs'])
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`Configuration field ${key} must be a positive integer`);
+  if (config.escalationIntervalMs <= config.cooldownMs)
+    throw new Error('Escalation interval must be longer than the normal cooldown');
   config.worker = path.resolve(path.dirname(config.cli), '../dist/runtime/worker.js');
   return Object.freeze(config);
 }
@@ -112,6 +120,30 @@ const has = (o, k) => Object.hasOwn(o, k);
 export const rootOf = config => config.root ?? config.home;
 const sameHarnesses = (a, config) => Array.isArray(a) && [...a].sort().join(',') === [...config.harnesses].sort().join(',');
 const initialState = () => ({ version: 1, restarts: [], candidate: null, failureSince: null, checkedAt: null });
+
+// Serialized into an isolated child using the reviewed CLI's client and normal proxy environment.
+async function readRemoteRecord(cli, spaceId) {
+  try {
+    const path = await import('node:path');
+    const { pathToFileURL } = await import('node:url');
+    if (!cli || !path.isAbsolute(cli) || !spaceId) throw new Error('Invalid probe arguments');
+    const { createClient } = await import(pathToFileURL(path.resolve(path.dirname(cli), '../dist/client.js')).href);
+    const result = await createClient().space(spaceId).sandbox.get();
+    if (!result || !Object.hasOwn(result, 'sandbox')) throw new Error('Missing sandbox record');
+    const record = result.sandbox;
+    if (record !== null && (typeof record !== 'object' || Array.isArray(record))) throw new Error('Invalid sandbox record');
+    const fields = ['provider', 'status', 'runtimeStatus', 'lastHeartbeatAt', 'stopReason'];
+    const projected = record === null ? null : Object.fromEntries(fields.map(key => {
+      const value = record[key];
+      if (value != null && typeof value !== 'string') throw new Error('Invalid sandbox field');
+      return [key, value ?? null];
+    }));
+    console.log(JSON.stringify(projected));
+  } catch {
+    console.error('Remote lifecycle record unavailable or malformed');
+    process.exitCode = 1;
+  }
+}
 
 export function redact(value) {
   if (typeof value === 'string') return value
@@ -203,6 +235,9 @@ export function summarizeStatus(raw, config = CONFIG) {
       typeof local.runtimeId !== 'string' || typeof local.state !== 'string' ||
       typeof local.harnessConnected !== 'boolean' || typeof local.workspaceConnected !== 'boolean'))
     throw new Error('Invalid local Runtime status');
+  if (raw.remote && ((raw.remote.runtimeId != null && (typeof raw.remote.runtimeId !== 'string' || !raw.remote.runtimeId)) ||
+      (raw.remote.observedAt != null && (typeof raw.remote.observedAt !== 'string' || !Number.isFinite(Date.parse(raw.remote.observedAt))))))
+    throw new Error('Invalid remote Runtime identity or observation time');
   let kind;
   if (raw.nativeSyncError) kind = 'config_error';
   else if (local && (local.root !== rootOf(config) || local.spaceId !== config.spaceId || !sameHarnesses(local.harnesses, config))) kind = 'scope_changed';
@@ -218,6 +253,9 @@ export function summarizeStatus(raw, config = CONFIG) {
   return {
     kind, runtimeId: local?.runtimeId ?? null, pid: local?.pid ?? null,
     localState: local?.state ?? null, online: raw.remote?.online ?? null,
+    remoteRuntimeId: raw.remote?.runtimeId ?? null,
+    remoteWorkspaceOnline: raw.remote?.workspace?.online ?? null,
+    remoteObservedAt: raw.remote?.observedAt ?? null,
     harnessConnected: local?.harnessConnected ?? false,
     workspaceConnected: local?.workspaceConnected ?? false,
     remoteError: redact(raw.remoteError), nativeSyncError: redact(raw.nativeSyncError),
@@ -233,8 +271,20 @@ export function startHarnessArgs(config) {
   return args;
 }
 
+export function staleDisconnected(sample, now, config, operation = null) {
+  const record = sample.remoteRecord;
+  const expectedId = sample.runtimeId ?? operation?.sourceRuntimeId;
+  const heartbeat = typeof record?.lastHeartbeatAt === 'string' ? Date.parse(record.lastHeartbeatAt) : NaN;
+  return ['connection_stuck', 'process_down'].includes(sample.kind) && sample.online === false &&
+    sample.remoteWorkspaceOnline === false && !sample.remoteError &&
+    (sample.remoteRuntimeId === null || (expectedId && sample.remoteRuntimeId === expectedId)) &&
+    record?.provider === 'local' && record.status === 'stopped' && record.stopReason === 'disconnected' &&
+    (record.runtimeStatus == null || ['stopped', 'disconnected'].includes(record.runtimeStatus)) &&
+    Number.isFinite(heartbeat) && heartbeat >= 0 && now - heartbeat >= config.staleHeartbeatMs;
+}
+
 export function decide(previous, sample, now, paused, config = CONFIG) {
-  const next = { ...previous, checkedAt: now, sample, paused };
+  const next = { ...previous, checkedAt: now, sample, paused, nextEligibleAt: null, recoveryMode: null };
   const recoverable = ['process_down', 'connection_stuck', 'shared_server_down'].includes(sample.kind);
   const fast = sample.kind === 'connection_stuck' && sample.transportFailure?.code === 1006 &&
     Number.isSafeInteger(sample.transportFailure.activeExecutions) && sample.transportFailure.activeExecutions > 0 &&
@@ -245,12 +295,57 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
   else if (key !== previous.candidate || gap) { next.candidate = key; next.failureSince = now; }
   next.action = 'observe';
   next.reason = paused ? 'paused' : sample.kind;
+  const pending = previous.pendingRecovery;
+  if (pending && !paused) {
+    if (sample.kind === 'another_runtime' && !sample.pid && sample.remoteRuntimeId === pending.sourceRuntimeId) {
+      next.reason = 'waiting_previous_lease';
+      return next;
+    }
+    if (sample.kind === 'another_runtime' || (sample.remoteRuntimeId && sample.remoteRuntimeId !== pending.sourceRuntimeId &&
+        sample.remoteRuntimeId !== sample.runtimeId)) {
+      next.reason = 'recovery_conflict';
+      return next;
+    }
+    if (recoverable && (!sample.pid || (sample.pid === pending.sourcePid && sample.runtimeId === pending.sourceRuntimeId))) {
+      const limited = pending.attempts >= config.maxResumeAttempts;
+      next.nextEligibleAt = limited
+        ? Math.max(pending.lastAttemptAt, previous.lastEscalationAt ?? 0) + config.escalationIntervalMs
+        : pending.nextAttemptAt;
+      next.reason = limited ? 'resume_retry_limited' : 'resume_wait';
+      if (now >= next.nextEligibleAt && (!limited || staleDisconnected(sample, now, config, pending))) {
+        next.action = 'recover';
+        next.reason = limited ? 'stale_disconnect_escalation' : 'resume_recovery';
+        next.recoveryMode = limited ? 'escalated' : 'resume';
+      }
+      return next;
+    }
+    return next;
+  }
   const confirmationMs = fast ? Math.min(config.unhealthyMs, config.executionDisconnectMs) : config.unhealthyMs;
   if (!key || paused || now - next.failureSince < confirmationMs) return next;
   const last = previous.restarts.at(-1);
+  const window = previous.restarts.filter(t => now - t < 3_600_000).sort((a, b) => a - b);
   if (last !== undefined && now - last < config.cooldownMs) next.reason = 'cooldown';
-  else if (previous.restarts.filter(t => now - t < 3_600_000).length >= config.maxRestartsPerHour) next.reason = 'rate_limited';
-  else { next.action = 'recover'; next.reason = sample.kind; }
+  else if (window.length >= config.maxRestartsPerHour) next.reason = 'rate_limited';
+  else { next.action = 'recover'; next.reason = sample.kind; next.recoveryMode = 'normal'; }
+  // A separate, slower lane is available only with fresh, authoritative offline evidence.
+  const escalationAt = Math.max(last ?? 0, previous.lastEscalationAt ?? 0) + config.escalationIntervalMs;
+  if (next.action !== 'recover') {
+    const normalAt = Math.max(now, (last ?? -config.cooldownMs) + config.cooldownMs,
+      window.length >= config.maxRestartsPerHour ? window[window.length - config.maxRestartsPerHour] + 3_600_000 : 0);
+    next.nextEligibleAt = normalAt;
+    if (staleDisconnected(sample, now, config)) {
+      next.nextEligibleAt = Math.min(normalAt, escalationAt);
+      if (now >= escalationAt) {
+        next.action = 'recover'; next.reason = 'stale_disconnect_escalation'; next.recoveryMode = 'escalated';
+      }
+    }
+  }
+  // An escalation remains spaced even if the normal rolling window later empties.
+  if (previous.lastEscalationAt != null && now < previous.lastEscalationAt + config.escalationIntervalMs) {
+    next.action = 'observe'; next.reason = 'escalation_cooldown';
+    next.nextEligibleAt = previous.lastEscalationAt + config.escalationIntervalMs;
+  }
   return next;
 }
 
@@ -308,6 +403,8 @@ async function networkEvidence(httpProbe) {
 export class Guard {
   constructor(config = CONFIG) {
     this.config = config;
+    this.now = () => Date.now();
+    this.notify = notice => console.error(JSON.stringify(redact({ event: 'recovery_blocked', ...notice })));
     this.names = stateNames(config.stateLayout);
     this.stateFile = path.join(config.directory, this.names.state);
     this.controlFile = path.join(config.directory, this.names.control);
@@ -386,17 +483,34 @@ export class Guard {
       try {
         const diagnostics = await this.cli(['runtime', 'logs', '--space', this.config.spaceId, '--limit', '200', '--level', 'debug', '--json'], 10_000);
         if (!diagnostics.ok) throw new Error(`Runtime diagnostics failed: ${redact(diagnostics.stderr || String(diagnostics.code))}`);
-        sample.transportFailure = executionDisconnect(JSON.parse(diagnostics.stdout), sample);
+        sample.transportFailure = executionDisconnect(JSON.parse(diagnostics.stdout), sample, this.now());
       } catch (error) {
         // Missing evidence never authorizes the short restart path.
         sample.transportEvidenceError = redact(error.message);
       }
+    }
+    if (['connection_stuck', 'process_down'].includes(sample.kind) && sample.online === false &&
+        sample.remoteWorkspaceOnline === false) {
+      try { sample.remoteRecord = await this.remoteRecord(); }
+      catch (error) { sample.remoteEvidenceError = redact(error.message); }
     }
     if (this.config.codexShared && ['healthy', 'connection_stuck', 'process_down'].includes(sample.kind)) {
       sample.sharedServer = await this.sharedServer();
       if (sample.kind === 'healthy' && sample.sharedServer.state === 'absent') sample.kind = 'shared_server_down';
     }
     return sample;
+  }
+  async remoteRecord() {
+    await this.refreshNetworkEnvironment();
+    const result = await this.command(this.config.node, [...(this.networkRoute === 'configured_proxy' ? ['--use-env-proxy'] : []),
+      '--input-type=module', '--eval', `await (${readRemoteRecord.toString()})(...process.argv.slice(1));`,
+      this.config.recoveryCli || this.config.cli, this.config.spaceId], this.config.probeTimeoutMs);
+    if (!result.ok) throw new Error('Remote lifecycle probe failed; escalation unavailable');
+    const record = JSON.parse(result.stdout);
+    if (record !== null && (typeof record !== 'object' || Array.isArray(record) ||
+        Object.values(record).some(v => v !== null && typeof v !== 'string')))
+      throw new Error('Invalid remote lifecycle record; escalation unavailable');
+    return record;
   }
   async sharedServer() {
     const socketPath = path.join(this.config.home, '.codex/app-server-control/app-server-control.sock');
@@ -446,7 +560,28 @@ export class Guard {
           !Number.isFinite(state.network.since) || !Number.isFinite(state.network.checkedAt) || !Number.isFinite(state.network.nextCheckAt) ||
           typeof state.network.blockRecovery !== 'boolean')))
       throw new Error('Invalid guard state; original file retained');
+    const pending = state.pendingRecovery;
+    const time = value => Number.isFinite(value) && value >= 0;
+    if ((state.lastEscalationAt != null && !time(state.lastEscalationAt)) ||
+        (state.lastNotice != null && (typeof state.lastNotice.key !== 'string' || !time(state.lastNotice.at))) ||
+        (pending != null && (!pending || typeof pending.id !== 'string' || !pending.id ||
+          !/^[a-f0-9]{64}$/.test(pending.scope) ||
+          !['stopping', 'awaiting_start', 'starting'].includes(pending.phase) ||
+          !['normal', 'escalated'].includes(pending.mode) ||
+          !time(pending.budgetAt) || !time(pending.lastAttemptAt) || !time(pending.nextAttemptAt) ||
+          pending.lastAttemptAt < pending.budgetAt || pending.nextAttemptAt < pending.lastAttemptAt ||
+          !Number.isSafeInteger(pending.attempts) || pending.attempts < 1 ||
+          !((pending.sourcePid === null && pending.sourceRuntimeId === null && pending.sourceNonce === null && pending.sourceIdentity === null) ||
+            (Number.isSafeInteger(pending.sourcePid) && pending.sourcePid > 1 &&
+              typeof pending.sourceRuntimeId === 'string' && pending.sourceRuntimeId &&
+              typeof pending.sourceNonce === 'string' && pending.sourceNonce &&
+              typeof pending.sourceIdentity === 'string' && pending.sourceIdentity)))))
+      throw new Error('Invalid recovery journal; original file retained');
     return state;
+  }
+  recoveryScope() {
+    return createHash('sha256').update(JSON.stringify([this.config.identity, this.config.spaceId, rootOf(this.config),
+      [...this.config.harnesses].sort(), this.config.codexShared])).digest('hex');
   }
   async save(state) { await atomicJson(this.stateFile, state); }
   async owner() {
@@ -468,9 +603,23 @@ export class Guard {
     if (this.config.recoveryCli)
       workers.push(path.resolve(path.dirname(this.config.recoveryCli), '../dist/runtime/worker.js'));
     if (!text.startsWith(`${process.getuid()} `) || !workers.some(worker =>
-      text.endsWith(`${node} ${worker}`) || text.endsWith(`${node} --use-env-proxy ${worker}`)))
-      throw new Error('PID is not the approved Runtime worker');
+      text.endsWith(`${node} ${worker}`) || text.endsWith(`${node} --use-env-proxy ${worker}`))) {
+      // After SIGKILL, ps can briefly expose a defunct command rather than the worker path.
+      const status = await this.command('/bin/ps', ['-p', String(pid), '-o', 'stat='], 3000);
+      if ((status.ok && /^Z\S*$/.test(status.stdout.trim())) ||
+          (!status.ok && status.code === 1 && !status.stdout.trim() && !status.stderr.trim())) return null;
+      if (!status.ok) throw new Error('Cannot inspect Runtime process exit state');
+      throw Object.assign(new Error('PID is not the approved Runtime worker'), { code: 'RUNTIME_IDENTITY_CHANGED' });
+    }
     return text;
+  }
+  async originalProcessAlive(pid, identity) {
+    try { return await this.processIdentity(pid) === identity; }
+    catch (error) {
+      // Only used after a verified stop/kill: a reused PID must never be signalled again.
+      if (error.code === 'RUNTIME_IDENTITY_CHANGED') return false;
+      throw error;
+    }
   }
   async preflight() {
     await this.checkCompatibility();
@@ -565,7 +714,8 @@ export class Guard {
     return assessNetwork({ summary: this.networkPolicy, configError: this.networkConfigError, sample,
       proxyChecks, diagnostics, now, intervalMs: this.config.intervalMs, previous });
   }
-  async recover(sample, beforeMutation) {
+  async recover(sample, beforeMutation, pending = null, progress = async () => {}, escalated = false) {
+    if (pending && pending.scope !== this.recoveryScope()) throw new Error('Pending recovery scope changed; refusing mutation');
     await this.preflight();
     if (await this.paused()) return { outcome: 'skipped', reason: 'paused' };
     const fresh = await this.probe();
@@ -573,6 +723,8 @@ export class Guard {
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
     if (sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
       return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
+    if (escalated && !staleDisconnected(fresh, this.now(), this.config, pending))
+      return { outcome: 'skipped', reason: 'Stale disconnect evidence changed since probe' };
     if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
       // Start is idempotent. Never stop or restart a daemon shared with other clients.
       await this.refreshNetworkEnvironment();
@@ -597,9 +749,14 @@ export class Guard {
       if (!owner || owner.pid !== sample.pid) throw new Error('Runtime ownership changed before stop');
       const identity = await this.processIdentity(sample.pid);
       if (!identity) return { outcome: 'skipped', reason: 'Process exited before stop' };
+      if (pending && (pending.sourcePid !== sample.pid || pending.sourceRuntimeId !== sample.runtimeId ||
+          pending.sourceNonce !== owner.nonce || pending.sourceIdentity !== identity))
+        throw new Error('Pending recovery process identity changed; refusing stop');
       await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId });
       const deadline = Date.now() + this.config.graceMs;
-      const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs, beforeMutation);
+      const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs,
+        beforeMutation && (() => beforeMutation('stopping', { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
+          sourceNonce: owner.nonce, sourceIdentity: identity })));
       await this.log('graceful_stop', { ok: stopped.ok, code: stopped.code, error: stopped.ok ? null : redact(stopped.stderr || stopped.stdout) });
       while (await this.processIdentity(sample.pid)) {
         if (Date.now() >= deadline) break;
@@ -618,20 +775,44 @@ export class Guard {
         if (await this.processIdentity(sample.pid) !== identity) throw new Error('Runtime identity changed before forced stop');
         process.kill(sample.pid, 'SIGKILL');
         await this.log('forced_stop', { pid: sample.pid, runtimeId: sample.runtimeId });
-        for (let n = 0; n < 20 && await this.processIdentity(sample.pid); n++) await sleep(250);
-        if (await this.processIdentity(sample.pid)) throw new Error('Runtime did not exit');
+        for (let n = 0; n < 20 && await this.originalProcessAlive(sample.pid, identity); n++) await sleep(250);
+        if (await this.originalProcessAlive(sample.pid, identity)) throw new Error('Runtime did not exit');
       }
+      await progress('awaiting_start');
     } else if (owner && await this.processIdentity(owner.pid)) {
       throw new Error('Owner process still exists but status is unavailable; refusing duplicate startup');
     }
+    if (pending?.sourcePid && !sample.pid && await this.processIdentity(pending.sourcePid))
+      throw new Error('Original Runtime process still exists; refusing duplicate startup');
     await this.preflight();
     const beforeStart = await this.probe();
+    await this.log('startup_probe', { sample: beforeStart, stoppedRuntimeId: pending?.sourceRuntimeId ?? sample.runtimeId });
+    if (beforeStart.kind === 'healthy' && beforeStart.runtimeId !== (pending?.sourceRuntimeId ?? sample.runtimeId)) {
+      const replacement = await this.owner();
+      if (!replacement || replacement.pid !== beforeStart.pid || !await this.processIdentity(beforeStart.pid))
+        throw new Error('Replacement Runtime ownership not verified');
+      await this.log('replacement_adopted', { pid: beforeStart.pid, runtimeId: beforeStart.runtimeId });
+      return { outcome: 'recovered', reason: 'replacement_adopted', pid: beforeStart.pid, runtimeId: beforeStart.runtimeId };
+    }
+    const sourceId = pending?.sourceRuntimeId ?? sample.runtimeId;
+    if (beforeStart.kind === 'another_runtime' || (sourceId && beforeStart.remoteRuntimeId && beforeStart.remoteRuntimeId !== sourceId))
+      return { outcome: 'pending', reason: beforeStart.kind === 'another_runtime' && beforeStart.remoteRuntimeId === sourceId
+        ? 'waiting_previous_lease' : 'recovery_conflict' };
     if (beforeStart.kind !== 'process_down') return { outcome: 'skipped', reason: `Startup no longer safe: ${beforeStart.kind}` };
+    const startOwner = await this.owner();
+    if (startOwner && await this.processIdentity(startOwner.pid))
+      throw new Error('Owner process appeared before startup; refusing duplicate startup');
+    const stoppedOwner = pending?.sourcePid ? { pid: pending.sourcePid, nonce: pending.sourceNonce } : sample.pid ? owner : null;
+    if (stoppedOwner && startOwner && (startOwner.pid !== stoppedOwner.pid || startOwner.nonce !== stoppedOwner.nonce))
+      throw new Error('Runtime owner changed after stop; refusing startup');
+    if (await this.paused()) return { outcome: 'pending', reason: 'paused' };
+    if (escalated && !staleDisconnected(beforeStart, this.now(), this.config, pending ?? { sourceRuntimeId: sourceId }))
+      return { outcome: 'pending', reason: 'Stale disconnect evidence changed before startup' };
     // The reviewed startup code reuses matching native consent without importing history.
     // Screen sharing must be explicitly enabled in the guard configuration.
     const start = await this.cli(['runtime', 'up', rootOf(this.config), '--space', this.config.spaceId,
       ...startHarnessArgs(this.config), ...(this.config.shareScreen ? ['--display', 'macos'] : ['--no-display']),
-      '-d', '--yes', '--json'], 90_000, beforeMutation);
+      '-d', '--yes', '--json'], 90_000, beforeMutation && (() => beforeMutation('starting')));
     await this.log('start_finished', { ok: start.ok, code: start.code, error: start.ok ? null : redact(start.stderr || start.stdout) });
     const after = await this.probe();
     if (after.kind !== 'healthy') throw new Error(`Startup not verified: ${after.kind}`);
@@ -670,6 +851,8 @@ export class Guard {
     return results;
   }
   async tick(state) {
+    if (state.pendingRecovery && state.pendingRecovery.scope !== this.recoveryScope())
+      throw new Error('Pending recovery scope changed; original journal retained');
     const paused = await this.paused();
     let sample;
     let compatibility;
@@ -689,7 +872,16 @@ export class Guard {
       network = { status: 'blocked', code: 'network_diagnostics_failed', action: 'check_network_diagnostics',
         error: redact(error.message), since: now, checkedAt: now, nextCheckAt: now + this.config.intervalMs, blockRecovery: true };
     }
-    const next = decide(state, sample, Date.now(), paused, this.config);
+    if (state.pendingRecovery && (sample.kind === 'healthy' ||
+        (sample.kind === 'connection_stuck' && sample.pid &&
+          (sample.pid !== state.pendingRecovery.sourcePid || sample.runtimeId !== state.pendingRecovery.sourceRuntimeId)))) {
+      // A start may have succeeded before its caller timed out or the guard exited.
+      // Never reuse the pending stop authorization against a replacement process.
+      await this.log('recovery_reconciled', { operationId: state.pendingRecovery.id, sample });
+      state = { ...state, pendingRecovery: null, candidate: null, failureSince: null,
+        lastRecovery: { ...state.lastRecovery, outcome: sample.kind === 'healthy' ? 'observed_healthy' : 'replacement_observed' } };
+    }
+    const next = decide(state, sample, this.now(), paused, this.config);
     next.guardPid = process.pid;
     next.networkRoute = this.networkRoute ?? 'unknown';
     next.network = network;
@@ -700,7 +892,25 @@ export class Guard {
       await this.log('network_status', network);
     next.compatibility = compatibility;
     await this.save(next);
-    await this.log('health', { paused, sample, decision: next.reason, networkRoute: next.networkRoute });
+    await this.log('health', { paused, sample, decision: next.reason, networkRoute: next.networkRoute,
+      nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null });
+    if (['cooldown', 'rate_limited', 'escalation_cooldown', 'resume_retry_limited', 'waiting_previous_lease',
+      'recovery_conflict'].includes(next.reason)) {
+      const key = `${next.reason}:${sample.runtimeId ?? 'absent'}:${sample.remoteRuntimeId ?? 'absent'}`;
+      if (next.lastNotice?.key !== key || this.now() - next.lastNotice.at >= this.config.escalationIntervalMs) {
+        const notice = { reason: next.reason, runtimeId: sample.runtimeId, remoteRuntimeId: sample.remoteRuntimeId,
+          nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null,
+          remoteEvidenceError: sample.remoteEvidenceError ?? null,
+          message: 'Recovery blocked; inspect the recorded reason and next eligible time. No task was replayed.' };
+        await this.log('recovery_blocked', notice);
+        this.notify(notice);
+        next.lastNotice = { key, at: this.now() };
+        await this.save(next);
+      }
+    } else if (sample.kind === 'healthy' && next.lastNotice != null) {
+      next.lastNotice = null;
+      await this.save(next);
+    }
     if (sample.kind !== 'healthy' && sample.kind !== 'compatibility_error' && sample.kind !== state.sample?.kind)
       await this.snapshot(sample.kind, sample);
     if (this.config.readyHooks && sample.kind === 'healthy' && sample.runtimeId !== state.readyRuntimeId) {
@@ -724,14 +934,41 @@ export class Guard {
       next.lastRecovery = { at: new Date().toISOString(), outcome: 'preparing' };
       await this.save(next);
       let reserved = false;
-      const reserveAttempt = async () => {
-        if (reserved) return;
-        next.restarts = [...next.restarts.filter(t => Date.now() - t < 3_600_000), Date.now()];
-        next.lastRecovery.outcome = 'started';
+      const reserveAttempt = async (phase, source) => {
+        if (await this.paused()) throw new Error('Recovery paused before mutation');
+        const now = this.now();
+        if (!reserved) {
+          if (!next.pendingRecovery) {
+            next.restarts = [...next.restarts.filter(t => now - t < 3_600_000), now];
+          }
+          if (next.recoveryMode === 'escalated') next.lastEscalationAt = now;
+        }
+        if (phase && !next.pendingRecovery) next.pendingRecovery = { id: randomUUID(), scope: this.recoveryScope(),
+          budgetAt: next.restarts.at(-1), mode: next.recoveryMode === 'escalated' ? 'escalated' : 'normal',
+          attempts: reserved ? 1 : 0, lastAttemptAt: now, nextAttemptAt: now + this.config.resumeRetryMs,
+          sourcePid: null, sourceRuntimeId: null, sourceNonce: null, sourceIdentity: null, ...source };
+        if (!reserved && next.pendingRecovery) next.pendingRecovery = {
+          ...next.pendingRecovery, attempts: next.pendingRecovery.attempts + 1,
+          lastAttemptAt: now, nextAttemptAt: now + this.config.resumeRetryMs,
+        };
+        if (phase && next.pendingRecovery) next.pendingRecovery = { ...next.pendingRecovery, phase };
+        next.lastRecovery = { ...next.lastRecovery, outcome: 'started',
+          operationId: next.pendingRecovery?.id ?? null, mode: next.recoveryMode };
         await this.save(next);
         reserved = true;
       };
-      try { next.lastRecovery = { ...next.lastRecovery, ...await this.recover(sample, reserveAttempt) }; }
+      const progress = async phase => {
+        if (next.pendingRecovery) {
+          next.pendingRecovery = { ...next.pendingRecovery, phase };
+          await this.save(next);
+        }
+      };
+      try {
+        const result = await this.recover(sample, reserveAttempt,
+          next.pendingRecovery, progress, next.recoveryMode === 'escalated');
+        next.lastRecovery = { ...next.lastRecovery, ...result };
+        if (next.lastRecovery.outcome === 'recovered') next.pendingRecovery = null;
+      }
       catch (e) { next.lastRecovery = { ...next.lastRecovery, outcome: reserved ? 'failed' : 'deferred', error: redact(e.message) }; }
       next.candidate = null;
       next.failureSince = null;
