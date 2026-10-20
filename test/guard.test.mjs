@@ -223,6 +223,175 @@ test('integration: active execution 1006 retains the actual worker without stop,
   assert.ok(calls.every(a => !a.includes('prompt') && !a.includes('import')));
 });
 
+async function overdue(g) {
+  const clock = Date.now();
+  g.now = () => clock;
+  const sample = await g.probe();
+  const state = advance(base(), sample, clock - g.config.disconnectedMs,
+    clock - g.config.intervalMs, false, g.config);
+  return { sample, state };
+}
+
+for (const activeExecutions of [0, 2]) {
+  test(`integration: sustained reconnecting restarts a real worker with ${activeExecutions} active executions`, async t => {
+    const g = await fixture(t);
+    await g.cli(['runtime', 'up']);
+    await setFixture(g, { stuck: true, activeExecutions });
+    const { sample, state } = await overdue(g);
+    const recovered = await g.tick(state);
+    assert.equal(recovered.reason, 'disconnect_timeout');
+    assert.equal(recovered.lastRecovery.outcome, 'recovered');
+    assert.equal(await g.processIdentity(sample.pid), null);
+    assert.notEqual((await g.probe()).pid, sample.pid);
+    const signals = (await fs.readFile(path.join(g.config.home, 'signals.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(signals, [{ pid: sample.pid, signal: 'SIGTERM' }]);
+    assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+    assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+    assert.ok(!(await fs.readFile(g.logFile, 'utf8')).includes('forced_stop'));
+  });
+}
+
+test('integration: overdue active worker gets SIGTERM then SIGKILL without signalling other workers', async t => {
+  const g = await fixture(t);
+  const other = await fixture(t);
+  await other.cli(['runtime', 'up']);
+  const otherPid = (await other.owner()).pid;
+  await setFixture(g, { ignoreTerm: true });
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, activeExecutions: 2 });
+  const { sample, state } = await overdue(g);
+  const command = g.command.bind(g);
+  g.command = (file, args, timeout) => args[0] === '-axo' ?
+    Promise.resolve({ ok: true, stdout: `${otherPid} ${sample.pid}\n`, stderr: '' }) : command(file, args, timeout);
+  const log = g.log.bind(g);
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'graceful_stop') await setFixture(g, { localState: 'stopping' });
+  };
+  const recovered = await g.tick(state);
+  assert.equal(recovered.lastRecovery.outcome, 'recovered');
+  assert.equal(await g.processIdentity(sample.pid), null);
+  assert.ok(await other.processIdentity(otherPid));
+  const events = (await fs.readFile(g.logFile, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(events.filter(e => ['graceful_stop', 'forced_stop'].includes(e.event)).map(e => e.signal),
+    ['SIGTERM', 'SIGKILL']);
+  assert.equal(events.find(e => e.event === 'forced_stop').childProcessesRetained, true);
+  assert.deepEqual(JSON.parse((await fs.readFile(path.join(g.config.home, 'signals.jsonl'), 'utf8')).trim()),
+    { pid: sample.pid, signal: 'SIGTERM' });
+  await assert.rejects(fs.access(path.join(other.config.home, 'signals.jsonl')), { code: 'ENOENT' });
+});
+
+test('integration: heartbeat timeout evidence alone reaches recovery and healthy status resets its timer', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  const owner = await g.owner();
+  let clock = Date.now();
+  g.now = () => clock;
+  await setFixture(g, { stuck: true, localState: 'ready', events: [{
+    runtimeId: owner.runtimeId, timestamp: new Date(clock).toISOString(),
+    event: 'runtime.heartbeat_timeout', data: { activeExecutions: 1, ageMs: 500_000 },
+  }] });
+  const sample = await g.probe();
+  assert.equal(sample.heartbeatTimeoutAt, clock);
+  const state = advance(base(), { ...sample, heartbeatTimeoutAt: clock - g.config.disconnectedMs },
+    clock - g.config.disconnectedMs, clock - g.config.intervalMs, false, g.config);
+  await setFixture(g, { stuck: false });
+  const healthy = await g.tick(state);
+  assert.equal(healthy.failureSince, null);
+  assert.equal(healthy.action, 'observe');
+  await setFixture(g, { stuck: true });
+  const fresh = await g.tick(healthy);
+  assert.equal(fresh.failureSince, clock);
+  assert.equal(fresh.action, 'observe');
+  let waiting = fresh;
+  const began = clock;
+  for (clock += g.config.intervalMs; clock < began + g.config.disconnectedMs; clock += g.config.intervalMs)
+    waiting = decide(waiting, { ...sample, heartbeatTimeoutAt: clock }, clock, false, g.config);
+  await setFixture(g, { events: [{ runtimeId: owner.runtimeId, timestamp: new Date(clock).toISOString(),
+    event: 'runtime.heartbeat_timeout', data: { activeExecutions: 1, ageMs: 740_000 } }] });
+  const recovered = await g.tick(waiting);
+  assert.equal(recovered.lastRecovery.outcome, 'recovered');
+  assert.equal(recovered.failureSince, null);
+  assert.notEqual((await g.probe()).pid, owner.pid);
+});
+
+test('integration: recovery between probes revokes overdue signal authorization', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, activeExecutions: 1 });
+  const { sample, state } = await overdue(g);
+  const authorized = decide(state, sample, g.now(), false, g.config);
+  await setFixture(g, { events: [{ runtimeId: sample.runtimeId,
+    timestamp: new Date(g.now()).toISOString(), event: 'runtime.ready' }] });
+  const result = await g.recover(sample, undefined, null, undefined, authorized);
+  assert.equal(result.outcome, 'skipped');
+  assert.ok(await g.processIdentity(sample.pid));
+  await assert.rejects(fs.access(path.join(g.config.home, 'signals.jsonl')), { code: 'ENOENT' });
+});
+
+test('integration: an interrupted overdue stop resumes without losing the deadline or double-counting recovery', async t => {
+  const g = await fixture(t);
+  await setFixture(g, { ignoreTerm: true });
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, activeExecutions: 1 });
+  const { sample, state } = await overdue(g);
+  const log = g.log.bind(g);
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'graceful_stop') {
+      await setFixture(g, { localState: 'stopping' });
+      throw new Error('Synthetic interruption after SIGTERM');
+    }
+  };
+  const interrupted = await g.tick(state);
+  assert.equal(interrupted.lastRecovery.outcome, 'failed');
+  assert.equal(interrupted.pendingRecovery.trigger, 'disconnect_timeout');
+  assert.equal(interrupted.pendingRecovery.phase, 'stopping');
+  assert.ok(await g.processIdentity(sample.pid));
+  const restarted = reopenGuard(g);
+  restarted.now = () => interrupted.nextEligibleAt;
+  const recovered = await restarted.tick(await restarted.loadState());
+  assert.equal(recovered.lastRecovery.outcome, 'recovered');
+  assert.equal(recovered.pendingRecovery, null);
+  assert.equal(recovered.restarts.length, 1);
+  assert.equal(await g.processIdentity(sample.pid), null);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+for (const boundary of ['before_term', 'before_kill']) {
+  test(`integration: dual-environment conflict ${boundary} blocks the next signal`, async t => {
+    const g = await fixture(t);
+    await setFixture(g, { ignoreTerm: true });
+    await g.cli(['runtime', 'up']);
+    await setFixture(g, { stuck: true, activeExecutions: 1 });
+    const { sample, state } = await overdue(g);
+    const conflict = async () => setFixture(g, {
+      remote: { online: true, runtimeId: 'other-environment', workspace: { online: true } },
+    });
+    if (boundary === 'before_term') {
+      const probe = g.probe.bind(g);
+      let probes = 0;
+      g.probe = async () => {
+        if (++probes === 3) await conflict();
+        return probe();
+      };
+    } else {
+      const log = g.log.bind(g);
+      g.log = async (event, data) => {
+        await log(event, data);
+        if (event === 'graceful_stop') await conflict();
+      };
+    }
+    const result = await g.tick(state);
+    assert.ok(['failed', 'deferred'].includes(result.lastRecovery.outcome));
+    assert.ok(await g.processIdentity(sample.pid));
+    assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
+    assert.ok(!(await fs.readFile(g.logFile, 'utf8')).includes('forced_stop'));
+    if (boundary === 'before_term')
+      await assert.rejects(fs.access(path.join(g.config.home, 'signals.jsonl')), { code: 'ENOENT' });
+  });
+}
+
 test('1006 evidence failure is visible and cannot authorize a fast restart', async t => {
   const g = await fixture(t);
   await g.cli(['runtime', 'up']);
@@ -790,6 +959,9 @@ test('public configuration requires explicit scope and an independent recovery C
   assert.equal(loaded.shareScreen, false);
   assert.equal(loaded.readyHooks, false);
   assert.equal(loaded.codexShared, false);
+  assert.equal(loaded.disconnectedMs, 240_000);
+  await fs.writeFile(file, JSON.stringify({ ...input, disconnectedMs: 180_000 }));
+  assert.equal((await loadConfig(file)).disconnectedMs, 180_000);
   const retired = { cooldownMs: 600000, maxRestartsPerHour: 3, resumeRetryMs: 30000,
     maxResumeAttempts: 3, escalationIntervalMs: 900000, staleHeartbeatMs: 120000 };
   await fs.writeFile(file, JSON.stringify({ ...input, ...retired }));
@@ -804,6 +976,7 @@ test('public configuration requires explicit scope and an independent recovery C
     { recoveryCli: input.cli }, { harnesses: ['codex', 'codex'] }, { typo: true }, { shareScreen: 'false' }, { graceMs: 0 },
     { codexShared: 'true' }, { codexShared: true, harnesses: ['pi'] },
     { retryBaseMs: 0 }, { retryMaxMs: 60001 }, { retryBaseMs: 5000, retryMaxMs: 1000 },
+    ...[0, -1, '240000', null, 1.5].map(disconnectedMs => ({ disconnectedMs })),
     { cooldownMs: 'broken' }]) {
     await fs.writeFile(file, JSON.stringify({ ...input, ...patch }));
     await assert.rejects(loadConfig(file));
@@ -882,7 +1055,7 @@ test('a proxy change immediately before stop defers recovery without consuming b
   const g = await fixture(t);
   await g.recover(await g.probe());
   const owner = await g.owner();
-  await setFixture(g, { stuck: true });
+  await setFixture(g, { stuck: true, localState: 'ready' });
   const pending = await g.tick(base());
   const invoke = g.cli.bind(g);
   g.cli = async (args, timeout, beforeExecute) => {
@@ -924,7 +1097,7 @@ test('10-20: a stopped worker retries its own stale lease under the same recover
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   g.remoteRecord = async () => null;
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true });
+  await setFixture(g, { stuck: true, localState: 'ready' });
   const old = await g.probe();
   const invoke = g.cli.bind(g);
   g.cli = async (args, timeout, beforeExecute) => {
@@ -1005,7 +1178,7 @@ test('pending stop survives a guard interruption and completion is charged once'
   let clock = Date.now();
   g.now = () => clock;
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true });
+  await setFixture(g, { stuck: true, localState: 'ready' });
   const invoke = g.cli.bind(g);
   g.cli = async (args, timeout, beforeExecute) => {
     const result = await invoke(args, timeout, beforeExecute);
@@ -1032,7 +1205,7 @@ test('a real competing remote instance is never replaced, even during a pending 
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   g.notify = () => {};
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true });
+  await setFixture(g, { stuck: true, localState: 'ready' });
   const invoke = g.cli.bind(g);
   g.cli = async (args, timeout, beforeExecute) => {
     const result = await invoke(args, timeout, beforeExecute);
@@ -1055,7 +1228,7 @@ test('pending recovery retains scope and process identity checks across restarts
   const g = await fixture(t);
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true });
+  await setFixture(g, { stuck: true, localState: 'ready' });
   const invoke = g.cli.bind(g);
   g.cli = async (args, timeout, beforeExecute) => {
     if (args[1] === 'down') {
@@ -1232,7 +1405,7 @@ test('successful recovery ignores legacy limits and clears backoff before a subs
   g.now = () => clock;
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true, remoteRecord: disconnectedRecord(clock) });
+  await setFixture(g, { stuck: true, localState: 'ready', remoteRecord: disconnectedRecord(clock) });
   const before = await g.probe();
   let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000],
     lastEscalationAt: clock });

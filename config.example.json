@@ -13,5 +13,6 @@
   "codex": "/absolute/path/to/codex",
   "pi": "/absolute/path/to/pi",
   "shareScreen": false,
-  "readyHooks": false
+  "readyHooks": false,
+  "disconnectedMs": 240000
 }

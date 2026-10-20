@@ -29,6 +29,7 @@ export const CONFIG = Object.freeze({
   probeTimeoutMs: 30_000,
   shareScreen: false,
   unhealthyMs: 120_000,
+  disconnectedMs: 240_000,
   executionDisconnectMs: 20_000,
   retryBaseMs: 5_000,
   retryMaxMs: 60_000,
@@ -68,7 +69,7 @@ export async function loadConfig(file) {
     'escalationIntervalMs', 'staleHeartbeatMs'];
   const fields = ['home', 'root', 'spaceId', 'identity', 'node', 'cli', 'recoveryCli', 'compatibilityFile',
     'directory', 'harnesses', 'codex', 'pi', 'codexShared', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
-    'unhealthyMs', 'executionDisconnectMs', 'graceMs', 'stateLayout', 'retryBaseMs', 'retryMaxMs', ...retired];
+    'unhealthyMs', 'disconnectedMs', 'executionDisconnectMs', 'graceMs', 'stateLayout', 'retryBaseMs', 'retryMaxMs', ...retired];
   for (const key of Object.keys(input)) if (!fields.includes(key)) throw new Error(`Unknown configuration field: ${key}`);
   for (const key of ['root', 'spaceId', 'identity', 'cli', 'recoveryCli', 'compatibilityFile', 'directory', 'harnesses'])
     if (!Object.hasOwn(input, key)) throw new Error(`Missing configuration field: ${key}`);
@@ -100,7 +101,7 @@ export async function loadConfig(file) {
     throw new Error('Shared Codex control requires the codex harness');
   if (config.shareScreen && process.platform !== 'darwin') throw new Error('Screen sharing is supported only on macOS');
   stateNames(config.stateLayout);
-  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'graceMs', 'retryBaseMs', 'retryMaxMs'])
+  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'disconnectedMs', 'executionDisconnectMs', 'graceMs', 'retryBaseMs', 'retryMaxMs'])
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`Configuration field ${key} must be a positive integer`);
   if (config.retryBaseMs > config.retryMaxMs || config.retryMaxMs > 60_000)
     throw new Error('Retry backoff must satisfy retryBaseMs <= retryMaxMs <= 60000');
@@ -278,22 +279,46 @@ export function retryDelay(attempts, config = CONFIG) {
     2 ** Math.min(Math.max(0, attempts - 1), Math.ceil(Math.log2(config.retryMaxMs / config.retryBaseMs))));
 }
 
+function disconnected(sample, state = null) {
+  const pending = state?.pendingRecovery;
+  const stopping = sample.localState === 'stopping' && pending?.phase === 'stopping' &&
+    pending.trigger === 'disconnect_timeout' && pending.sourcePid === sample.pid &&
+    pending.sourceRuntimeId === sample.runtimeId;
+  return sample.kind === 'connection_stuck' && !!sample.pid && !sample.transportEvidenceError &&
+    (sample.localState === 'reconnecting' || Number.isFinite(sample.heartbeatTimeoutAt) || stopping);
+}
+
+function disconnectExpired(sample, state, config, afterTerm = false) {
+  const stillDisconnected = disconnected(sample, state) || (afterTerm && sample.kind === 'connection_stuck' &&
+    sample.localState === 'stopping' && !sample.transportEvidenceError);
+  return stillDisconnected && state?.candidate === `connection_stuck:${sample.runtimeId}` &&
+    state.sample?.pid === sample.pid && state.sample?.runtimeId === sample.runtimeId &&
+    Number.isFinite(state.failureSince) && Number.isFinite(state.checkedAt) &&
+    state.checkedAt - state.failureSince >= config.disconnectedMs &&
+    !(sample.connectionRecoveredAt > state.failureSince);
+}
+
 export function decide(previous, sample, now, paused, config = CONFIG) {
   const next = { ...previous, checkedAt: now, sample, paused, nextEligibleAt: null, recoveryMode: null };
   const recoverable = ['process_down', 'connection_stuck', 'shared_server_down'].includes(sample.kind);
   const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}` : null;
   const gap = previous.checkedAt !== null && (now - previous.checkedAt > config.intervalMs * 3 || now < previous.checkedAt);
   if (!key || paused) { next.candidate = null; next.failureSince = null; }
-  else if (key !== previous.candidate || gap) { next.candidate = key; next.failureSince = now; }
+  else if (key !== previous.candidate || gap ||
+      (disconnected(sample, next) && (!disconnected(previous.sample ?? {}, previous) || previous.sample.pid !== sample.pid ||
+        sample.connectionRecoveredAt > previous.failureSince))) {
+    next.candidate = key; next.failureSince = now;
+  }
   next.action = 'observe';
   next.reason = paused ? 'paused' : sample.kind;
-  const protectedExecution = executionProtection(sample);
+  const protectedExecution = executionProtection(sample, next, config);
   if (!paused && protectedExecution) {
-    next.candidate = null;
-    next.failureSince = null;
+    if (!disconnected(sample, next)) { next.candidate = null; next.failureSince = null; }
     next.reason = protectedExecution;
     return next;
   }
+  // Neither an idle count nor an old retry journal can shorten a new transport outage.
+  if (!paused && disconnected(sample, next) && !disconnectExpired(sample, next, config)) return next;
   const pending = previous.pendingRecovery;
   if (sample.kind === 'healthy') next.retry = null;
   // Old journals may contain a 15-minute nextAttemptAt. Recompute only the short delay.
@@ -320,24 +345,55 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
     }
     return next;
   }
-  if (!key || paused || (retry?.candidate !== key && now - next.failureSince < config.unhealthyMs)) return next;
+  const confirmationMs = disconnected(sample, next) ? config.disconnectedMs : config.unhealthyMs;
+  if (!key || paused || (retry?.candidate !== key && now - next.failureSince < confirmationMs)) return next;
   if (retryAt !== null && now < retryAt) {
     next.reason = 'retry_backoff';
     next.nextEligibleAt = retryAt;
   } else {
-    next.action = 'recover'; next.reason = sample.kind; next.recoveryMode = 'normal';
+    next.action = 'recover';
+    next.reason = disconnectExpired(sample, next, config) ? 'disconnect_timeout' : sample.kind;
+    next.recoveryMode = 'normal';
   }
   return next;
 }
 
-export function executionProtection(sample) {
+export function executionProtection(sample, outage = null, config = CONFIG) {
   if (!sample.pid || sample.kind !== 'connection_stuck') return null;
+  if (disconnectExpired(sample, outage, config)) return null;
   if (sample.executionActivity?.state === 'active' ||
       (sample.executionActivity?.state !== 'idle' && sample.transportFailure?.activeExecutions > 0))
     return 'execution_active';
   if (sample.harnessConnected !== false || sample.executionActivity?.state !== 'idle')
     return 'execution_activity_unknown';
   return null;
+}
+
+export function connectionEvidence(events, sample, now = Date.now()) {
+  if (!Array.isArray(events)) throw new Error('Invalid Runtime diagnostics');
+  let connectionRecoveredAt = null;
+  let heartbeatTimeoutAt = null;
+  for (const e of events) {
+    if (e?.runtimeId !== sample.runtimeId ||
+        !['runtime.ready', 'runtime.heartbeat_timeout'].includes(e.event)) continue;
+    const at = Date.parse(e.timestamp);
+    if (!Number.isFinite(at)) throw new Error('Invalid Runtime diagnostic timestamp');
+    if (e.event === 'runtime.heartbeat_timeout' && has(e.data ?? {}, 'ageMs') &&
+        (!Number.isSafeInteger(e.data.ageMs) || e.data.ageMs < 0))
+      throw new Error('Invalid Runtime heartbeat age');
+    if (at > now) continue;
+    if (e.event === 'runtime.ready') connectionRecoveredAt = Math.max(connectionRecoveredAt ?? at, at);
+    else {
+      if (has(e.data ?? {}, 'ageMs')) {
+        const receivedAt = at - e.data.ageMs;
+        connectionRecoveredAt = Math.max(connectionRecoveredAt ?? receivedAt, receivedAt);
+      }
+      if (now - at <= 30_000) heartbeatTimeoutAt = Math.max(heartbeatTimeoutAt ?? at, at);
+    }
+  }
+  if (heartbeatTimeoutAt !== null && connectionRecoveredAt !== null && connectionRecoveredAt >= heartbeatTimeoutAt)
+    heartbeatTimeoutAt = null;
+  return { connectionRecoveredAt, heartbeatTimeoutAt };
 }
 
 export function executionActivity(events, sample, now = Date.now()) {
@@ -501,6 +557,7 @@ export class Guard {
         const events = JSON.parse(diagnostics.stdout);
         sample.transportFailure = executionDisconnect(events, sample, this.now());
         sample.executionActivity = executionActivity(events, sample, this.now());
+        Object.assign(sample, connectionEvidence(events, sample, this.now()));
       } catch (error) {
         // Missing or malformed evidence must block even the generic restart path.
         sample.executionActivity = { state: 'unknown' };
@@ -588,6 +645,7 @@ export class Guard {
           !/^[a-f0-9]{64}$/.test(pending.scope) ||
           !['stopping', 'awaiting_start', 'starting'].includes(pending.phase) ||
           !['normal', 'escalated'].includes(pending.mode) ||
+          (pending.trigger !== undefined && pending.trigger !== 'disconnect_timeout') ||
           !time(pending.budgetAt) || !time(pending.lastAttemptAt) || !time(pending.nextAttemptAt) ||
           pending.lastAttemptAt < pending.budgetAt || pending.nextAttemptAt < pending.lastAttemptAt ||
           !Number.isSafeInteger(pending.attempts) || pending.attempts < 1 ||
@@ -734,16 +792,21 @@ export class Guard {
     return assessNetwork({ summary: this.networkPolicy, configError: this.networkConfigError, sample,
       proxyChecks, diagnostics, now, intervalMs: this.config.intervalMs, previous });
   }
-  async recover(sample, beforeMutation, pending = null, progress = async () => {}) {
+  async recover(sample, beforeMutation, pending = null, progress = async () => {}, outage = null) {
     if (pending && pending.scope !== this.recoveryScope()) throw new Error('Pending recovery scope changed; refusing mutation');
     await this.preflight();
     if (await this.paused()) return { outcome: 'skipped', reason: 'paused' };
     const fresh = await this.probe();
     if (fresh.kind !== sample.kind || fresh.pid !== sample.pid || fresh.runtimeId !== sample.runtimeId)
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
-    if (executionProtection(fresh))
-      return { outcome: 'skipped', reason: executionProtection(fresh) };
-    if (sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
+    if (executionProtection(fresh, outage, this.config))
+      return { outcome: 'skipped', reason: executionProtection(fresh, outage, this.config) };
+    const prolongedDisconnect = disconnectExpired(sample, outage, this.config);
+    const safeToStop = (latest, afterTerm = false) => latest.kind === sample.kind && latest.pid === sample.pid &&
+      latest.runtimeId === sample.runtimeId && (prolongedDisconnect
+        ? disconnectExpired(latest, outage, this.config, afterTerm) : !executionProtection(latest));
+    if (!safeToStop(fresh)) return { outcome: 'skipped', reason: 'Connection recovered since probe' };
+    if (!prolongedDisconnect && sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
       return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
     if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
       // Start is idempotent. Never stop or restart a daemon shared with other clients.
@@ -772,18 +835,33 @@ export class Guard {
       if (pending && (pending.sourcePid !== sample.pid || pending.sourceRuntimeId !== sample.runtimeId ||
           pending.sourceNonce !== owner.nonce || pending.sourceIdentity !== identity))
         throw new Error('Pending recovery process identity changed; refusing stop');
-      const deadline = Date.now() + this.config.graceMs;
-      const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs,
-        async () => {
-          const latest = await this.probe();
-          if (latest.kind !== sample.kind || latest.pid !== sample.pid || latest.runtimeId !== sample.runtimeId ||
-              executionProtection(latest))
-            throw new Error('Execution safety changed before stop; retaining Runtime');
-          await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId });
-          if (beforeMutation) await beforeMutation('stopping', { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
-            sourceNonce: owner.nonce, sourceIdentity: identity });
-        });
-      await this.log('graceful_stop', { ok: stopped.ok, code: stopped.code, error: stopped.ok ? null : redact(stopped.stderr || stopped.stdout) });
+      const beforeStop = async () => {
+        if (!safeToStop(await this.probe()))
+          throw new Error('Execution safety changed before stop; retaining Runtime');
+        await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId,
+          reason: prolongedDisconnect ? 'disconnect_timeout' : sample.kind });
+        if (beforeMutation) await beforeMutation('stopping', { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
+          sourceNonce: owner.nonce, sourceIdentity: identity,
+          ...(prolongedDisconnect ? { trigger: 'disconnect_timeout' } : {}) });
+      };
+      let deadline;
+      if (prolongedDisconnect) {
+        await beforeStop();
+        const current = await this.owner();
+        if (await this.paused()) return { outcome: 'pending', reason: 'paused' };
+        if (!current || current.pid !== owner.pid || current.nonce !== owner.nonce ||
+            await this.processIdentity(sample.pid) !== identity)
+          throw new Error('Runtime process was replaced; refusing to signal');
+        // Signal only the verified worker, never its process group or shared app-server.
+        process.kill(sample.pid, 'SIGTERM');
+        deadline = Date.now() + this.config.graceMs;
+        await this.log('graceful_stop', { ok: true, signal: 'SIGTERM', pid: sample.pid, reason: 'disconnect_timeout' });
+      } else {
+        deadline = Date.now() + this.config.graceMs;
+        const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'],
+          this.config.graceMs, beforeStop);
+        await this.log('graceful_stop', { ok: stopped.ok, code: stopped.code, error: stopped.ok ? null : redact(stopped.stderr || stopped.stdout) });
+      }
       while (await this.processIdentity(sample.pid)) {
         if (Date.now() >= deadline) break;
         await sleep(500);
@@ -791,20 +869,21 @@ export class Guard {
       const remaining = await this.processIdentity(sample.pid);
       if (remaining) {
         const latest = await this.probe();
-        if (latest.kind !== 'connection_stuck' || latest.pid !== sample.pid || latest.runtimeId !== sample.runtimeId ||
-            executionProtection(latest))
+        if (latest.kind !== 'connection_stuck' || !safeToStop(latest, prolongedDisconnect) || await this.paused())
           throw new Error('Execution safety unknown before forced stop; retaining Runtime');
         const current = await this.owner();
         if (!current || current.pid !== owner.pid || current.nonce !== owner.nonce || remaining !== identity)
           throw new Error('Runtime process was replaced; refusing to kill');
         const children = await this.command('/bin/ps', ['-axo', 'pid=,ppid='], 3000);
         if (!children.ok) throw new Error('Cannot verify Runtime child processes');
-        if (children.stdout.trim().split('\n').some(line => Number(line.trim().split(/\s+/)[1]) === sample.pid))
+        const hasChildren = children.stdout.trim().split('\n').some(line => Number(line.trim().split(/\s+/)[1]) === sample.pid);
+        if (hasChildren && !prolongedDisconnect)
           throw new Error('Runtime still has child processes; refusing to orphan them');
         // Never signal a process group or a PID inferred only from a stale status file.
         if (await this.processIdentity(sample.pid) !== identity) throw new Error('Runtime identity changed before forced stop');
         process.kill(sample.pid, 'SIGKILL');
-        await this.log('forced_stop', { pid: sample.pid, runtimeId: sample.runtimeId });
+        await this.log('forced_stop', { pid: sample.pid, runtimeId: sample.runtimeId, signal: 'SIGKILL',
+          childProcessesRetained: hasChildren });
         for (let n = 0; n < 20 && await this.originalProcessAlive(sample.pid, identity); n++) await sleep(250);
         if (await this.originalProcessAlive(sample.pid, identity)) throw new Error('Runtime did not exit');
       }
@@ -980,6 +1059,8 @@ export class Guard {
           ...next.pendingRecovery, attempts: Math.min(Number.MAX_SAFE_INTEGER, next.pendingRecovery.attempts + 1),
           lastAttemptAt: now, nextAttemptAt: now + retryDelay(next.retry.attempts, this.config),
         };
+        if (source?.trigger && next.pendingRecovery)
+          next.pendingRecovery = { ...next.pendingRecovery, trigger: source.trigger };
         if (phase && next.pendingRecovery) next.pendingRecovery = { ...next.pendingRecovery, phase };
         next.lastRecovery = { ...next.lastRecovery, outcome: 'started',
           operationId: next.pendingRecovery?.id ?? null, mode: next.recoveryMode };
@@ -993,11 +1074,13 @@ export class Guard {
         }
       };
       try {
-        const result = await this.recover(sample, reserveAttempt, next.pendingRecovery, progress);
+        const result = await this.recover(sample, reserveAttempt, next.pendingRecovery, progress, next);
         next.lastRecovery = { ...next.lastRecovery, ...result };
         if (next.lastRecovery.outcome === 'recovered') {
           next.pendingRecovery = null;
           next.retry = null;
+          next.candidate = null;
+          next.failureSince = null;
         }
       }
       catch (e) { next.lastRecovery = { ...next.lastRecovery, outcome: reserved ? 'failed' : 'deferred', error: redact(e.message) }; }

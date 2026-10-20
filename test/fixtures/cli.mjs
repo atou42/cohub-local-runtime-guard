@@ -30,7 +30,7 @@ if (args[0] === 'network-env') {
   const healthy = running && !setup.stuck;
   emit({ spaceId: setup.spaceId, local: running ? {
     pid: o.pid, runtimeId: o.runtimeId, root: setup.root ?? home, spaceId: setup.spaceId,
-    harnesses: setup.harnesses ?? ['codex', 'pi'], state: healthy ? 'ready' : 'reconnecting',
+    harnesses: setup.harnesses ?? ['codex', 'pi'], state: healthy ? 'ready' : setup.localState ?? 'reconnecting',
     harnessConnected: !!healthy, workspaceConnected: !!healthy,
   } : null, remote: setup.remote ?? { online: !!healthy, runtimeId: healthy ? o.runtimeId : null, workspace: { online: !!healthy } },
   remoteError: null, nativeSyncError: null, pendingLocalArchives: 0 });
@@ -55,6 +55,11 @@ if (args[0] === 'network-env') {
   if (o && alive(o.pid)) throw new Error('Duplicate Runtime');
   const child = spawn(process.execPath, [setup.worker], { detached: true, stdio: 'ignore', env: { HOME: home } });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  for (let n = 0; ; n++) {
+    try { await fs.access(path.join(home, `worker-ready-${child.pid}`)); break; }
+    catch (error) { if (error.code !== 'ENOENT' || n >= 100) throw error; }
+    await sleep(10);
+  }
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(ownerFile, JSON.stringify({ pid: child.pid, nonce: randomUUID(), runtimeId: randomUUID(), socket: path.join(dir, 'control.sock') }));
   await fs.writeFile(path.join(home, 'fixture.json'), JSON.stringify({ ...setup, stuck: false }));
