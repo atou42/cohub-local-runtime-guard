@@ -281,15 +281,19 @@ export function retryDelay(attempts, config = CONFIG) {
 export function decide(previous, sample, now, paused, config = CONFIG) {
   const next = { ...previous, checkedAt: now, sample, paused, nextEligibleAt: null, recoveryMode: null };
   const recoverable = ['process_down', 'connection_stuck', 'shared_server_down'].includes(sample.kind);
-  const fast = sample.kind === 'connection_stuck' && sample.transportFailure?.code === 1006 &&
-    Number.isSafeInteger(sample.transportFailure.activeExecutions) && sample.transportFailure.activeExecutions > 0 &&
-    Number.isFinite(sample.transportFailure.closedAt);
-  const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}${fast ? `:1006:${sample.transportFailure.closedAt}` : ''}` : null;
+  const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}` : null;
   const gap = previous.checkedAt !== null && (now - previous.checkedAt > config.intervalMs * 3 || now < previous.checkedAt);
   if (!key || paused) { next.candidate = null; next.failureSince = null; }
   else if (key !== previous.candidate || gap) { next.candidate = key; next.failureSince = now; }
   next.action = 'observe';
   next.reason = paused ? 'paused' : sample.kind;
+  const protectedExecution = executionProtection(sample);
+  if (!paused && protectedExecution) {
+    next.candidate = null;
+    next.failureSince = null;
+    next.reason = protectedExecution;
+    return next;
+  }
   const pending = previous.pendingRecovery;
   if (sample.kind === 'healthy') next.retry = null;
   // Old journals may contain a 15-minute nextAttemptAt. Recompute only the short delay.
@@ -316,8 +320,7 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
     }
     return next;
   }
-  const confirmationMs = fast ? Math.min(config.unhealthyMs, config.executionDisconnectMs) : config.unhealthyMs;
-  if (!key || paused || (retry?.candidate !== key && now - next.failureSince < confirmationMs)) return next;
+  if (!key || paused || (retry?.candidate !== key && now - next.failureSince < config.unhealthyMs)) return next;
   if (retryAt !== null && now < retryAt) {
     next.reason = 'retry_backoff';
     next.nextEligibleAt = retryAt;
@@ -327,10 +330,44 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
   return next;
 }
 
+export function executionProtection(sample) {
+  if (!sample.pid || sample.kind !== 'connection_stuck') return null;
+  if (sample.executionActivity?.state === 'active' ||
+      (sample.executionActivity?.state !== 'idle' && sample.transportFailure?.activeExecutions > 0))
+    return 'execution_active';
+  if (sample.harnessConnected !== false || sample.executionActivity?.state !== 'idle')
+    return 'execution_activity_unknown';
+  return null;
+}
+
+export function executionActivity(events, sample, now = Date.now()) {
+  if (!Array.isArray(events)) throw new Error('Invalid Runtime diagnostics');
+  // A disconnect is not an execution failure. Only a recent, explicit zero count
+  // from this instance can establish idle; a new turn or connection invalidates it.
+  const relevant = events.filter(e => e?.runtimeId === sample.runtimeId &&
+    /^(runtime\.(websocket\.(closed|rejected|connecting|open)|heartbeat_timeout|ready|turn_received|auth_(required|token_failed)))$/.test(e.event));
+  for (const e of relevant) {
+    if (!Number.isFinite(Date.parse(e.timestamp))) throw new Error('Invalid Runtime diagnostic timestamp');
+    if (has(e.data ?? {}, 'activeExecutions') &&
+        (!Number.isSafeInteger(e.data.activeExecutions) || e.data.activeExecutions < 0))
+      throw new Error('Invalid Runtime execution count');
+  }
+  relevant.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  const last = relevant.at(-1);
+  const at = Date.parse(last?.timestamp);
+  if (!last || at > now) return { state: 'unknown' };
+  const count = last.data?.activeExecutions;
+  if (count > 0) return { state: 'active', count, observedAt: at };
+  if (count === 0 && now - at <= 30_000 &&
+      ['runtime.websocket.closed', 'runtime.heartbeat_timeout'].includes(last.event))
+    return { state: 'idle', count, observedAt: at };
+  return { state: 'unknown' };
+}
+
 export function executionDisconnect(events, sample, now = Date.now()) {
   if (!Array.isArray(events)) throw new Error('Invalid Runtime diagnostics');
   if (sample.kind !== 'connection_stuck') return null;
-  // Only the current instance's latest lifecycle event can accelerate recovery.
+  // Retained for incident diagnostics, never as authorization to interrupt work.
   const relevant = events.filter(e => e?.runtimeId === sample.runtimeId &&
     /^(runtime\.ready|runtime\.websocket\.(closed|rejected)|runtime\.auth_(required|token_failed))$/.test(e.event));
   for (const e of relevant)
@@ -461,9 +498,12 @@ export class Guard {
       try {
         const diagnostics = await this.cli(['runtime', 'logs', '--space', this.config.spaceId, '--limit', '200', '--level', 'debug', '--json'], 10_000);
         if (!diagnostics.ok) throw new Error(`Runtime diagnostics failed: ${redact(diagnostics.stderr || String(diagnostics.code))}`);
-        sample.transportFailure = executionDisconnect(JSON.parse(diagnostics.stdout), sample, this.now());
+        const events = JSON.parse(diagnostics.stdout);
+        sample.transportFailure = executionDisconnect(events, sample, this.now());
+        sample.executionActivity = executionActivity(events, sample, this.now());
       } catch (error) {
-        // Missing evidence never authorizes the short restart path.
+        // Missing or malformed evidence must block even the generic restart path.
+        sample.executionActivity = { state: 'unknown' };
         sample.transportEvidenceError = redact(error.message);
       }
     }
@@ -701,6 +741,8 @@ export class Guard {
     const fresh = await this.probe();
     if (fresh.kind !== sample.kind || fresh.pid !== sample.pid || fresh.runtimeId !== sample.runtimeId)
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
+    if (executionProtection(fresh))
+      return { outcome: 'skipped', reason: executionProtection(fresh) };
     if (sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
       return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
     if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
@@ -730,11 +772,17 @@ export class Guard {
       if (pending && (pending.sourcePid !== sample.pid || pending.sourceRuntimeId !== sample.runtimeId ||
           pending.sourceNonce !== owner.nonce || pending.sourceIdentity !== identity))
         throw new Error('Pending recovery process identity changed; refusing stop');
-      await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId });
       const deadline = Date.now() + this.config.graceMs;
       const stopped = await this.cli(['runtime', 'down', '--space', this.config.spaceId, '--yes', '--json'], this.config.graceMs,
-        beforeMutation && (() => beforeMutation('stopping', { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
-          sourceNonce: owner.nonce, sourceIdentity: identity })));
+        async () => {
+          const latest = await this.probe();
+          if (latest.kind !== sample.kind || latest.pid !== sample.pid || latest.runtimeId !== sample.runtimeId ||
+              executionProtection(latest))
+            throw new Error('Execution safety changed before stop; retaining Runtime');
+          await this.log('stop_requested', { pid: sample.pid, runtimeId: sample.runtimeId });
+          if (beforeMutation) await beforeMutation('stopping', { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
+            sourceNonce: owner.nonce, sourceIdentity: identity });
+        });
       await this.log('graceful_stop', { ok: stopped.ok, code: stopped.code, error: stopped.ok ? null : redact(stopped.stderr || stopped.stdout) });
       while (await this.processIdentity(sample.pid)) {
         if (Date.now() >= deadline) break;
@@ -742,6 +790,10 @@ export class Guard {
       }
       const remaining = await this.processIdentity(sample.pid);
       if (remaining) {
+        const latest = await this.probe();
+        if (latest.kind !== 'connection_stuck' || latest.pid !== sample.pid || latest.runtimeId !== sample.runtimeId ||
+            executionProtection(latest))
+          throw new Error('Execution safety unknown before forced stop; retaining Runtime');
         const current = await this.owner();
         if (!current || current.pid !== owner.pid || current.nonce !== owner.nonce || remaining !== identity)
           throw new Error('Runtime process was replaced; refusing to kill');

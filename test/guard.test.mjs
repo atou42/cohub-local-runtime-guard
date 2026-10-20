@@ -8,7 +8,8 @@ import { createServer } from 'node:net';
 import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, retryDelay, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock, executionDisconnect, stateNames, CLI_CONTRACT } from '../guard.mjs';
 
 const base = () => ({ version: 1, restarts: [], checkedAt: null, candidate: null, failureSince: null });
-const failed = { kind: 'connection_stuck', runtimeId: 'runtime-a', pid: 300 };
+const failed = { kind: 'connection_stuck', runtimeId: 'runtime-a', pid: 300,
+  harnessConnected: false, executionActivity: { state: 'idle' } };
 const policy = { ...CONFIG, intervalMs: 30, unhealthyMs: 120, retryBaseMs: 50, retryMaxMs: 600 };
 const advance = (state, sample, from, until, paused = false, config = policy) => {
   for (let t = from; t <= until; t += config.intervalMs) state = decide(state, sample, t, paused, config);
@@ -54,7 +55,7 @@ test('short retries never bypass another_runtime protection', () => {
     assert.equal(blocked.reason, 'another_runtime');
   }
 });
-test('1006 acceleration rejects stale, foreign, idle, recovered and fatal diagnostics', () => {
+test('1006 diagnostic evidence rejects stale, foreign, idle, recovered and fatal events', () => {
   const now = Date.now();
   const sample = { ...failed };
   const event = { timestamp: new Date(now - 100).toISOString(), runtimeId: sample.runtimeId,
@@ -74,18 +75,20 @@ test('1006 acceleration rejects stale, foreign, idle, recovered and fatal diagno
   assert.throws(() => executionDisconnect({}, sample), /Invalid/);
   assert.throws(() => executionDisconnect([{ ...event, timestamp: 'broken' }], sample), /timestamp/);
 });
-test('active execution 1006 uses a short confirmation window, not the generic two minutes', () => {
+test('active execution 1006 never accelerates a destructive restart', () => {
   const config = { ...policy, intervalMs: 10, executionDisconnectMs: 20 };
-  const sample = { ...failed, transportFailure: { code: 1006, activeExecutions: 1, closedAt: 0 } };
+  const sample = { ...failed, executionActivity: { state: 'active' },
+    transportFailure: { code: 1006, activeExecutions: 1, closedAt: 0 } };
   let state = decide(base(), sample, 0, false, config);
   state = decide(state, sample, 10, false, config);
   assert.equal(state.action, 'observe');
   state = decide(state, sample, 20, false, config);
-  assert.equal(state.action, 'recover');
+  assert.equal(state.action, 'observe');
+  assert.equal(state.reason, 'execution_active');
   assert.equal(decide(state, { kind: 'healthy' }, 21, false, config).action, 'observe');
   assert.equal(decide(state, sample, 21, true, config).action, 'observe');
   assert.equal(decide({ ...state, retry: { attempts: 1, lastAttemptAt: 20, candidate: state.candidate } },
-    sample, 30, false, config).reason, 'retry_backoff');
+    sample, 30, false, config).reason, 'execution_active');
   const replaced = { ...sample, transportFailure: { ...sample.transportFailure, closedAt: 30 } };
   assert.equal(decide(state, replaced, 30, false, config).action, 'observe');
 });
@@ -169,6 +172,11 @@ async function fixture(t, target = CONFIG, rootName = null) {
   await fs.writeFile(path.join(home, 'fixture.json'), JSON.stringify({ identity: config.identity, spaceId: config.spaceId, worker: config.worker,
     root: rootOf(config), harnesses: config.harnesses }));
   const g = new Guard(config);
+  const cli = g.cli.bind(g);
+  g.cli = async (args, ...rest) => {
+    if (args[1] === 'logs') await setFixture(g, { diagnosticNow: new Date(g.now()).toISOString() });
+    return cli(args, ...rest);
+  };
   g.systemProxyReader = async () => '<dictionary> {}';
   g.networkSourceEnv = {};
   g.proxyProbe = async endpoint => ({ ...endpoint, ok: true });
@@ -192,23 +200,26 @@ async function setFixture(g, patch) {
   await fs.writeFile(f, JSON.stringify({ ...await readJson(f), ...patch }));
 }
 
-test('integration: active execution 1006 restarts promptly without replay or a duplicate worker', async t => {
+test('integration: active execution 1006 retains the actual worker without stop, replay or duplicate', async t => {
   const g = await fixture(t);
   g.config = { ...g.config, intervalMs: 10_000, executionDisconnectMs: 20, unhealthyMs: 120_000, graceMs: 30_000 };
   await g.cli(['runtime', 'up']);
-  await setFixture(g, { stuck: true, disconnectAt: new Date().toISOString() });
+  await setFixture(g, { stuck: true, activeExecutions: 2, disconnectAt: new Date().toISOString() });
   const sample = await g.probe();
   assert.equal(sample.transportFailure.code, 1006);
   assert.equal(sample.transportFailure.activeExecutions, 2);
   let state = decide(base(), sample, Date.now() - 25, false, g.config);
   state = await g.tick(state);
-  assert.equal(state.lastRecovery.outcome, 'recovered');
-  assert.equal((await g.probe()).kind, 'healthy');
-  assert.notEqual((await g.probe()).pid, sample.pid);
-  assert.equal(await g.processIdentity(sample.pid), null);
+  assert.equal(state.reason, 'execution_active');
+  assert.equal(state.lastRecovery, undefined);
+  assert.equal((await g.probe()).pid, sample.pid);
+  assert.ok(await g.processIdentity(sample.pid));
+  // An old pending journal must not bypass execution protection.
+  assert.equal(decide({ ...state, pendingRecovery: { sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId,
+    attempts: 1, lastAttemptAt: 0 } }, sample, Date.now(), false, g.config).reason, 'execution_active');
   const calls = (await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(calls.filter(a => a[1] === 'down').length, 1);
-  assert.equal(calls.filter(a => a[1] === 'up').length, 2);
+  assert.equal(calls.filter(a => a[1] === 'down').length, 0);
+  assert.equal(calls.filter(a => a[1] === 'up').length, 1);
   assert.ok(calls.every(a => !a.includes('prompt') && !a.includes('import')));
 });
 
@@ -222,19 +233,62 @@ test('1006 evidence failure is visible and cannot authorize a fast restart', asy
   assert.equal(advance(base(), sample, 0, 90).action, 'observe');
 });
 
-test('1006 recovery rechecks the same disconnect before stopping a worker', async t => {
+test('recovery refuses to stop a worker after execution evidence disappears', async t => {
   const g = await fixture(t);
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, disconnectAt: new Date().toISOString() });
   const sample = await g.probe();
-  assert.equal(sample.transportFailure.code, 1006);
+  assert.equal(sample.executionActivity.state, 'idle');
   await setFixture(g, { events: [] });
   assert.deepEqual(await g.recover(sample), {
-    outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe',
+    outcome: 'skipped', reason: 'execution_activity_unknown',
   });
   assert.equal((await g.probe()).pid, sample.pid);
   const calls = (await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(calls.filter(a => a[1] === 'down').length, 0);
+});
+
+test('activity appearing immediately before down prevents the actual stop command', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true });
+  const sample = await g.probe();
+  const cli = g.cli.bind(g);
+  g.cli = async (args, ...rest) => {
+    if (args[1] === 'down') await setFixture(g, { activeExecutions: 1 });
+    return cli(args, ...rest);
+  };
+  await assert.rejects(g.recover(sample), /Execution safety changed before stop/);
+  assert.ok(await g.processIdentity(sample.pid));
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+});
+
+test('unknown diagnostics remain non-destructive beyond the generic deadline', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  const pid = (await g.owner()).pid;
+  await setFixture(g, { stuck: true, events: [] });
+  g.config = { ...g.config, unhealthyMs: 0 };
+  const state = await g.tick(base());
+  assert.equal(state.reason, 'execution_activity_unknown');
+  assert.ok(await g.processIdentity(pid));
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+});
+
+test('activity discovered after a refused graceful stop prevents forced termination', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, refuseStop: true });
+  const sample = await g.probe();
+  const cli = g.cli.bind(g);
+  g.cli = async (args, ...rest) => {
+    const result = await cli(args, ...rest);
+    if (args[1] === 'down') await setFixture(g, { activeExecutions: 1 });
+    return result;
+  };
+  await assert.rejects(g.recover(sample), /Execution safety unknown before forced stop/);
+  assert.ok(await g.processIdentity(sample.pid));
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
 });
 
 test('schema 2 accepts verified versions by contract but rejects tampering and version relabeling', async t => {
@@ -903,11 +957,11 @@ test('10-20: a stopped worker retries its own stale lease under the same recover
   assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 4);
 });
 
-test('10-20: old exhausted budgets no longer stop a disconnected runtime, even without heartbeat evidence', () => {
+test('10-20: old exhausted budgets do not prevent a confirmed idle runtime recovery', () => {
   const now = Date.parse('2026-10-20T09:35:37Z');
   const restarts = ['08:56:25.321', '09:10:03.193', '09:20:18.574'].map(s => Date.parse(`2026-10-20T${s}Z`));
-  const sample = { ...staleOffline(now), transportFailure: { code: 1006, activeExecutions: 1, closedAt: now - 32_000 } };
-  const first = decide({ ...base(), restarts }, sample, now - 25_000, false, CONFIG);
+  const sample = staleOffline(now);
+  const first = advance({ ...base(), restarts }, sample, now - CONFIG.unhealthyMs, now - CONFIG.intervalMs, false, CONFIG);
   const state = decide(first, sample, now, false, CONFIG);
   assert.equal(state.action, 'recover');
   assert.equal(state.reason, 'connection_stuck');
@@ -1263,12 +1317,14 @@ test('instance conflict notices survive restarts without notifying on every poll
   assert.ok((await calls(g)).every(a => !['up', 'down'].includes(a[1])));
 });
 
-test('10-20 timeline replay: previous recoveries never block the 17:35 fast recovery', () => {
+test('10-20 timeline replay: active work is retained and confirmed idle recovery still works', () => {
   const at = time => Date.parse(`2026-10-20T${time}+08:00`);
   let state = base();
-  const sample = { ...failed, transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('16:55:41') } };
+  const sample = { ...failed, executionActivity: { state: 'active' },
+    transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('16:55:41') } };
   state = advance(state, sample, at('16:55:53'), at('16:56:13'), false, CONFIG);
-  assert.equal(state.action, 'recover');
+  assert.equal(state.action, 'observe');
+  assert.equal(state.reason, 'execution_active');
   state = { ...state, restarts: [at('16:56:25')], pendingRecovery: null };
   state = decide(state, { kind: 'healthy' }, at('16:56:42'), false, CONFIG);
   const bridgeLost = { ...failed, pid: 301, runtimeId: 'runtime-b' };
@@ -1281,8 +1337,8 @@ test('10-20 timeline replay: previous recoveries never block the 17:35 fast reco
   const latest = { ...sample, pid: 302, runtimeId: 'runtime-c',
     transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('17:35:05') } };
   state = advance(state, latest, at('17:35:13'), at('17:35:33'), false, CONFIG);
-  assert.equal(state.action, 'recover');
-  assert.equal(state.recoveryMode, 'normal');
+  assert.equal(state.action, 'observe');
+  assert.equal(state.reason, 'execution_active');
 });
 
 test('18:20 regression: a defunct ps command after forced stop does not abort replacement startup', async t => {
