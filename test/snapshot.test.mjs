@@ -4,7 +4,9 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createSnapshot } from '../scripts/snapshot-cli.mjs';
-import { inspectCli } from '../guard.mjs';
+import { CLI_CONTRACT, inspectCli } from '../guard.mjs';
+const verification = async () => ({ id: CLI_CONTRACT, passed: true, checkedAt: new Date().toISOString(),
+  activeExecution1006: 'waits_for_execution' });
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'guard-snapshot-test-'));
@@ -18,14 +20,27 @@ async function fixture(t) {
   return { source, destination: path.join(root, 'reviewed-cli'), baseline: path.join(root, 'baseline.json'), reviewed: true };
 }
 
-test('snapshot copies trusted files without executing them and records a matching baseline', async t => {
+test('snapshot publishes the independent copy only after behavioral verification', async t => {
   const config = await fixture(t);
-  const result = await createSnapshot(config);
+  const result = await createSnapshot(config, async cli => {
+    assert.ok(cli.includes('.partial-'));
+    await assert.rejects(fs.access(config.baseline), { code: 'ENOENT' });
+    return verification();
+  });
   assert.equal(result.version, '10.1.0');
   assert.deepEqual(await inspectCli(result.recoveryCli), { version: result.version, fingerprint: result.fingerprint });
   assert.equal(JSON.parse(await fs.readFile(config.baseline)).fingerprint, result.fingerprint);
+  assert.equal(JSON.parse(await fs.readFile(config.baseline)).schemaVersion, 2);
   await fs.writeFile(path.join(config.source, 'bin/cohub.js'), '// global upgrade\n');
   assert.equal((await inspectCli(result.recoveryCli)).fingerprint, result.fingerprint);
+});
+
+test('failed behavior verification cannot publish a baseline or a usable snapshot', async t => {
+  const config = await fixture(t);
+  await assert.rejects(createSnapshot(config, async () => { throw new Error('consent changed'); }), /consent changed/);
+  await assert.rejects(fs.access(config.baseline), { code: 'ENOENT' });
+  await assert.rejects(fs.access(config.destination), { code: 'ENOENT' });
+  assert.ok((await fs.readdir(path.dirname(config.destination))).some(name => name.includes('.partial-')));
 });
 
 test('snapshot requires explicit review and never overwrites existing evidence', async t => {

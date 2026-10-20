@@ -6,7 +6,8 @@ This is an independent recovery tool, not an official Cohub component and not a 
 
 ## Recovery Policy
 
-- Check every 30 seconds; require two minutes of continuously confirmed failure before recovery.
+- Check every 10 seconds; require two minutes of continuously confirmed failure before recovery.
+- For a current Runtime's abnormal WebSocket close (`1006`) with active executions, require only 20 seconds of continuously confirmed disconnection. This shorter window still respects pause, network checks, ownership, consent, cooldown and hourly limits. Missing, stale, malformed or superseded diagnostic evidence cannot authorize the shorter window.
 - Allow at most three recovery attempts per hour, with a ten-minute cooldown. These records survive guard restarts.
 - Do not restart on an ambiguous API timeout, changed account or consent, malformed state, or another Runtime owning the Space.
 - Stop gracefully first. After a 30-second grace period, force-stop only a verified Runtime parent with unchanged ownership and no remaining child processes. Never signal an entire process group.
@@ -17,7 +18,7 @@ This is an independent recovery tool, not an official Cohub component and not a 
 
 Node.js 22.21+ or 24+, a separately installed Cohub CLI, and an existing authorized Local Runtime. No npm dependencies or installation hooks are required for this project.
 
-The production watchdog has been exercised on macOS. The synthetic process tests also run in Linux CI; that is not a claim of Linux production validation. Windows is not supported. Native consent configuration version 2 and the CLI status/control interfaces must match the implementation. The current recovery workflow was checked with Cohub CLI 10.1.0; a fingerprint is change detection, not a security audit or a guarantee of future server protocol compatibility.
+The production watchdog has been exercised on macOS. The synthetic process tests also run in Linux CI; that is not a claim of Linux production validation. Windows is not supported. Native consent configuration version 2 and the CLI status/control interfaces must match the implementation. CLI 10.6.0 passes the isolated behavioral checks described below; 10.1.0 legacy baselines remain supported. There is no hardcoded approved-version list. A fingerprint is change detection, not a security audit or a guarantee of future server protocol compatibility.
 
 ## Setup
 
@@ -25,14 +26,14 @@ Start and authorize your Runtime using Cohub's normal interactive workflow first
 
 1. Clone this repository and run `npm test`.
 2. Review the installed Cohub CLI that you intend to use for recovery. Do not acknowledge unknown code only to clear a warning.
-3. Make an independent copy of its complete package, including installed dependencies. The snapshot helper copies files only; it does not install or execute the CLI. It requires existing parent directories and refuses to overwrite a copy or baseline.
+3. Make an independent copy of its complete package, including installed dependencies. After explicit review, the snapshot helper executes the copied CLI in a disposable HOME to verify command flags, existing consent preservation, no history import, and the actual connection loop under an active-execution `1006` disconnect. It starts only a loopback WebSocket fixture, not a real Runtime, harness or model. This is isolation from production configuration, not an OS security sandbox: review remains mandatory. It requires existing parent directories and refuses to overwrite a copy or baseline.
 
 ```sh
 mkdir -p ./data
 node scripts/snapshot-cli.mjs \
   --source /absolute/path/to/installed/cohub-cli \
-  --destination "$PWD/data/reviewed-cli-10.1.0" \
-  --baseline "$PWD/data/baseline-10.1.0.json" \
+  --destination "$PWD/data/reviewed-cli-10.6.0" \
+  --baseline "$PWD/data/baseline-10.6.0.json" \
   --ack-reviewed
 ```
 
@@ -74,11 +75,25 @@ node guard.mjs resume --config ./config.local.json
 
 To manage multiple Spaces, use a separate configuration and private state directory for each. Do not run this public copy alongside another guard for the same Space, even with a different state directory: the singleton lock is per state directory, not a cross-application lock.
 
+For installations migrating from the original local Chinese-named guard, `stateLayout: "legacy-zh"` preserves its existing state, pause control, recovery budget, diagnostics and singleton lock filenames. It does not reset or copy state. Keep the same state directory and stop the previous guard before starting this one. Other installations should retain the default `"standard"` layout.
+
 ## CLI Upgrades
 
 The guard always executes the reviewed copy. `compatibility.version` is that recovery version; `installedVersion` is the global CLI version when readable. A global code/dependency change sets `upgradeStatus: review_required`; a partial or missing install sets `upgradeStatus: unavailable`. Both are informational and monitoring/recovery continues through the reviewed copy.
 
 Only a damaged reviewed copy or baseline blocks recovery. This protection is not bypassed. To adopt a newer CLI, review and test it, create a new snapshot and baseline at new paths, pause/stop the guard, update its configuration, run `check`, then restart and resume the guard. Do not modify a reviewed copy in place or regenerate a fingerprint merely to silence an error. The guard does not auto-upgrade Cohub, automatically review releases, or promise indefinite compatibility with server changes.
+
+New snapshots use baseline schema 2: an exact reviewed version and source/dependency-version fingerprint, plus a passing `cohub-runtime-guard/v2` behavioral record. Future versions can be adopted through the same verifier instead of editing a version allowlist. An interface change or failed check blocks publication of the new baseline and retains isolated evidence; it does not disable the old reviewed copy. Existing schema 1 baselines retain their original fingerprint-only semantics.
+
+To verify a reviewed candidate without publishing a snapshot:
+
+```sh
+node scripts/verify-cli.mjs --cli /absolute/path/to/cohub-cli/bin/cohub.js --ack-reviewed
+```
+
+### CLI 10.6.0 Findings
+
+The published 10.6.0 `dist/runtime/connection.js` is byte-identical to 10.1.0. Its connection loop waits for active execution promises to settle after a nonfatal abnormal close before returning to reconnect. The isolated real-WebSocket check on 2026-10-20 observed close code `1006`, one active execution, no second ready during a 2.5-second hold, and a second ready after releasing that execution (`activeExecution1006: "waits_for_execution"`). This is not a CLI reconnect fix. The guard's bounded restart is the fallback; interrupted tasks are not replayed or promised seamless continuation. Future versions reporting `"reconnects"` are also accepted if all checks pass.
 
 ## Proxy And Network Supervision
 
@@ -132,7 +147,7 @@ Optional `readyHooks: true` dispatches existing `.cohub/hooks/*.json` workspace-
 npm test
 ```
 
-Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery.
+Tests use temporary directories, synthetic CLI replies and isolated Node workers. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes active-execution `1006` fast recovery with one replacement worker and no prompt replay, rejection of stale/foreign/fatal/recovered diagnostics, schema 2 verification failures, legacy state preservation, shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery. Run the separate candidate verifier above against each reviewed CLI release; `npm test` does not require an installed Cohub CLI.
 
 ## License
 

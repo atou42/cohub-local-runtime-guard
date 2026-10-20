@@ -25,15 +25,17 @@ export const CONFIG = Object.freeze({
   codex: '/example/bin/codex',
   pi: '/example/bin/pi',
   directory: path.join(os.homedir(), '.local/state/cohub-runtime-guard/example-space'),
-  intervalMs: 30_000,
+  intervalMs: 10_000,
   probeTimeoutMs: 30_000,
   shareScreen: false,
   unhealthyMs: 120_000,
+  executionDisconnectMs: 20_000,
   cooldownMs: 600_000,
   maxRestartsPerHour: 3,
   graceMs: 30_000,
   // Optional: dispatch existing workspace-ready JSON hooks once per Runtime instance.
   readyHooks: false,
+  stateLayout: 'standard',
 });
 
 // Synthetic target presets are also used by the regression tests. The executable
@@ -63,7 +65,7 @@ export async function loadConfig(file) {
   if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Invalid guard configuration');
   const fields = ['home', 'root', 'spaceId', 'identity', 'node', 'cli', 'recoveryCli', 'compatibilityFile',
     'directory', 'harnesses', 'codex', 'pi', 'codexShared', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
-    'unhealthyMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'];
+    'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs', 'stateLayout'];
   for (const key of Object.keys(input)) if (!fields.includes(key)) throw new Error(`Unknown configuration field: ${key}`);
   for (const key of ['root', 'spaceId', 'identity', 'cli', 'recoveryCli', 'compatibilityFile', 'directory', 'harnesses'])
     if (!Object.hasOwn(input, key)) throw new Error(`Missing configuration field: ${key}`);
@@ -89,11 +91,22 @@ export async function loadConfig(file) {
   if (config.codexShared && !config.harnesses.includes('codex'))
     throw new Error('Shared Codex control requires the codex harness');
   if (config.shareScreen && process.platform !== 'darwin') throw new Error('Screen sharing is supported only on macOS');
-  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'])
+  stateNames(config.stateLayout);
+  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs'])
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`Configuration field ${key} must be a positive integer`);
   config.worker = path.resolve(path.dirname(config.cli), '../dist/runtime/worker.js');
   return Object.freeze(config);
 }
+
+export function stateNames(layout = 'standard') {
+  if (layout === 'standard') return { state: 'state.json', control: 'control.json', events: 'events.jsonl',
+    incidents: 'incidents', startup: 'startup-errors.log', lock: 'lock.json' };
+  if (layout === 'legacy-zh') return { state: '状态.json', control: '控制.json', events: '事件.jsonl',
+    incidents: '故障', startup: '启动错误.log', lock: '守护锁.json' };
+  throw new Error('Unknown stateLayout; use standard or legacy-zh');
+}
+
+export const CLI_CONTRACT = 'cohub-runtime-guard/v2';
 
 const has = (o, k) => Object.hasOwn(o, k);
 export const rootOf = config => config.root ?? config.home;
@@ -223,18 +236,40 @@ export function startHarnessArgs(config) {
 export function decide(previous, sample, now, paused, config = CONFIG) {
   const next = { ...previous, checkedAt: now, sample, paused };
   const recoverable = ['process_down', 'connection_stuck', 'shared_server_down'].includes(sample.kind);
-  const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}` : null;
+  const fast = sample.kind === 'connection_stuck' && sample.transportFailure?.code === 1006 &&
+    Number.isSafeInteger(sample.transportFailure.activeExecutions) && sample.transportFailure.activeExecutions > 0 &&
+    Number.isFinite(sample.transportFailure.closedAt);
+  const key = recoverable ? `${sample.kind}:${sample.runtimeId ?? 'absent'}${fast ? `:1006:${sample.transportFailure.closedAt}` : ''}` : null;
   const gap = previous.checkedAt !== null && (now - previous.checkedAt > config.intervalMs * 3 || now < previous.checkedAt);
   if (!key || paused) { next.candidate = null; next.failureSince = null; }
   else if (key !== previous.candidate || gap) { next.candidate = key; next.failureSince = now; }
   next.action = 'observe';
   next.reason = paused ? 'paused' : sample.kind;
-  if (!key || paused || now - next.failureSince < config.unhealthyMs) return next;
+  const confirmationMs = fast ? Math.min(config.unhealthyMs, config.executionDisconnectMs) : config.unhealthyMs;
+  if (!key || paused || now - next.failureSince < confirmationMs) return next;
   const last = previous.restarts.at(-1);
   if (last !== undefined && now - last < config.cooldownMs) next.reason = 'cooldown';
   else if (previous.restarts.filter(t => now - t < 3_600_000).length >= config.maxRestartsPerHour) next.reason = 'rate_limited';
   else { next.action = 'recover'; next.reason = sample.kind; }
   return next;
+}
+
+export function executionDisconnect(events, sample, now = Date.now()) {
+  if (!Array.isArray(events)) throw new Error('Invalid Runtime diagnostics');
+  if (sample.kind !== 'connection_stuck') return null;
+  // Only the current instance's latest lifecycle event can accelerate recovery.
+  const relevant = events.filter(e => e?.runtimeId === sample.runtimeId &&
+    /^(runtime\.ready|runtime\.websocket\.(closed|rejected)|runtime\.auth_(required|token_failed))$/.test(e.event));
+  for (const e of relevant)
+    if (!Number.isFinite(Date.parse(e.timestamp))) throw new Error('Invalid Runtime diagnostic timestamp');
+  relevant.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  const last = relevant.at(-1);
+  const at = Date.parse(last?.timestamp);
+  if (!last || last.event !== 'runtime.websocket.closed' || last.data?.code !== 1006 ||
+      last.data.fatal !== false || last.data.conflict !== false ||
+      !Number.isSafeInteger(last.data.activeExecutions) || last.data.activeExecutions < 1 ||
+      at > now || now - at > 15 * 60_000) return null;
+  return { code: 1006, activeExecutions: last.data.activeExecutions, closedAt: at };
 }
 
 export function safeRuntimeEvents(events) {
@@ -273,9 +308,10 @@ async function networkEvidence(httpProbe) {
 export class Guard {
   constructor(config = CONFIG) {
     this.config = config;
-    this.stateFile = path.join(config.directory, 'state.json');
-    this.controlFile = path.join(config.directory, 'control.json');
-    this.logFile = path.join(config.directory, 'events.jsonl');
+    this.names = stateNames(config.stateLayout);
+    this.stateFile = path.join(config.directory, this.names.state);
+    this.controlFile = path.join(config.directory, this.names.control);
+    this.logFile = path.join(config.directory, this.names.events);
     this.nativeFile = path.join(config.home, '.local/state/cohub/runtime', config.spaceId, 'native/config.json');
     const key = createHash('sha256').update(`${config.identity}\0${config.spaceId}`).digest('hex').slice(0, 24);
     this.ownerFile = path.join(config.home, '.local/state/cohub/instances', key, 'owner.json');
@@ -294,8 +330,8 @@ export class Guard {
   }
   async init() {
     await fs.mkdir(this.config.directory, { recursive: true, mode: 0o700 });
-    await fs.mkdir(path.join(this.config.directory, 'incidents'), { recursive: true, mode: 0o700 });
-    await rotate(path.join(this.config.directory, 'startup-errors.log'), 1024 * 1024, 2);
+    await fs.mkdir(path.join(this.config.directory, this.names.incidents), { recursive: true, mode: 0o700 });
+    await rotate(path.join(this.config.directory, this.names.startup), 1024 * 1024, 2);
   }
   async log(event, data = {}) {
     await rotate(this.logFile);
@@ -346,6 +382,16 @@ export class Guard {
     if (!result.ok && result.killed) throw new Error(`Runtime probe timed out after ${this.config.probeTimeoutMs} ms`);
     if (!result.ok) throw new Error(`Runtime probe failed: ${redact(result.stderr || result.stdout || String(result.code))}`);
     const sample = summarizeStatus(JSON.parse(result.stdout), this.config);
+    if (sample.kind === 'connection_stuck') {
+      try {
+        const diagnostics = await this.cli(['runtime', 'logs', '--space', this.config.spaceId, '--limit', '200', '--level', 'debug', '--json'], 10_000);
+        if (!diagnostics.ok) throw new Error(`Runtime diagnostics failed: ${redact(diagnostics.stderr || String(diagnostics.code))}`);
+        sample.transportFailure = executionDisconnect(JSON.parse(diagnostics.stdout), sample);
+      } catch (error) {
+        // Missing evidence never authorizes the short restart path.
+        sample.transportEvidenceError = redact(error.message);
+      }
+    }
     if (this.config.codexShared && ['healthy', 'connection_stuck', 'process_down'].includes(sample.kind)) {
       sample.sharedServer = await this.sharedServer();
       if (sample.kind === 'healthy' && sample.sharedServer.state === 'absent') sample.kind = 'shared_server_down';
@@ -444,12 +490,17 @@ export class Guard {
   }
   async checkCompatibility() {
     const baseline = await readJson(this.config.compatibilityFile);
-    if (baseline.schemaVersion !== 1 || !/^\d+\.\d+\.\d+$/.test(baseline.reviewedVersion) ||
+    if (![1, 2].includes(baseline.schemaVersion) || !/^\d+\.\d+\.\d+$/.test(baseline.reviewedVersion) ||
         !/^[a-f0-9]{64}$/.test(baseline.fingerprint)) throw new Error('Invalid CLI compatibility baseline');
+    if (baseline.schemaVersion === 2 && (baseline.contract?.id !== CLI_CONTRACT ||
+        baseline.contract.passed !== true || !Number.isFinite(Date.parse(baseline.contract.checkedAt)) ||
+        !['reconnects', 'waits_for_execution'].includes(baseline.contract.activeExecution1006)))
+      throw new Error('Invalid CLI behavioral compatibility record');
     const current = await inspectCli(this.config.recoveryCli || this.config.cli);
-    if (current.fingerprint !== baseline.fingerprint)
+    if ((baseline.schemaVersion === 2 && current.version !== baseline.reviewedVersion) || current.fingerprint !== baseline.fingerprint)
       throw new Error(`CLI compatibility: ${current.version} Runtime/startup code or dependencies changed; review required`);
-    const result = { status: 'compatible', ...current, reviewedVersion: baseline.reviewedVersion };
+    const result = { status: 'compatible', ...current, reviewedVersion: baseline.reviewedVersion,
+      verification: baseline.schemaVersion === 2 ? baseline.contract : { id: 'legacy-fingerprint', passed: true } };
     if (this.config.recoveryCli) {
       result.executionSource = 'reviewed_copy';
       result.cli = this.config.recoveryCli;
@@ -480,7 +531,7 @@ export class Guard {
       catch (e) { diagnosticsError = redact(e.message); }
     } else diagnosticsError = redact(result.stderr || result.stdout || String(result.code));
     const name = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}.json`;
-    const directory = path.join(this.config.directory, 'incidents');
+    const directory = path.join(this.config.directory, this.names.incidents);
     let network;
     try { network = await this.network(); }
     catch (error) { network = [{ fault: this.networkConfigError?.code ?? 'network_diagnostics_failed', error: redact(error.message) }]; }
@@ -520,6 +571,8 @@ export class Guard {
     const fresh = await this.probe();
     if (fresh.kind !== sample.kind || fresh.pid !== sample.pid || fresh.runtimeId !== sample.runtimeId)
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
+    if (sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
+      return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
     if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
       // Start is idempotent. Never stop or restart a daemon shared with other clients.
       await this.refreshNetworkEnvironment();
@@ -689,8 +742,8 @@ export class Guard {
   }
 }
 
-export async function acquireLock(directory) {
-  const file = path.join(directory, 'lock.json');
+export async function acquireLock(directory, layout = 'standard') {
+  const file = path.join(directory, stateNames(layout).lock);
   const value = { pid: process.pid, nonce: randomUUID() };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -713,7 +766,7 @@ export async function acquireLock(directory) {
   throw new Error('Cannot acquire guard lock');
 }
 
-async function main(command, file) {
+export async function main(command, file) {
   if (!['status', 'check', 'pause', 'resume', 'run'].includes(command)) throw new Error('Unknown guard command');
   const guard = new Guard(await loadConfig(file));
   await guard.init();
@@ -734,7 +787,7 @@ async function main(command, file) {
       network: await guard.monitorNetwork(sample, (await guard.loadState()).network) }, null, 2));
     return;
   }
-  const unlock = await acquireLock(guard.config.directory);
+  const unlock = await acquireLock(guard.config.directory, guard.config.stateLayout);
   const controller = new AbortController();
   const stop = () => controller.abort();
   process.once('SIGTERM', stop);

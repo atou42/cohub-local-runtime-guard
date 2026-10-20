@@ -4,7 +4,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { inspectCli } from '../guard.mjs';
+import { CLI_CONTRACT, inspectCli } from '../guard.mjs';
+import { verifyCli } from './verify-cli.mjs';
 
 async function requireAbsent(file) {
   try { await fs.lstat(file); }
@@ -16,7 +17,7 @@ const within = (parent, child) => {
   return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
 };
 
-export async function createSnapshot({ source, destination, baseline, reviewed }) {
+export async function createSnapshot({ source, destination, baseline, reviewed }, verify = verifyCli) {
   if (reviewed !== true) throw new Error('Review the installed CLI and explicitly acknowledge it with --ack-reviewed');
   for (const [key, value] of Object.entries({ source, destination, baseline }))
     if (typeof value !== 'string' || !path.isAbsolute(value)) throw new Error(`${key} must be an absolute path`);
@@ -35,16 +36,21 @@ export async function createSnapshot({ source, destination, baseline, reviewed }
   // Node 22 rejects an existing destination directory with errorOnExist.
   const copiedRoot = path.join(staging, 'package');
   await fs.cp(source, copiedRoot, { recursive: true, dereference: true, errorOnExist: true, force: false });
+  const contract = await verify(path.join(copiedRoot, 'bin/cohub.js'));
+  if (contract?.id !== CLI_CONTRACT || contract.passed !== true ||
+      !Number.isFinite(Date.parse(contract.checkedAt)) ||
+      !['reconnects', 'waits_for_execution'].includes(contract.activeExecution1006))
+    throw new Error(`Invalid CLI verification result; partial copy retained at ${staging}`);
   const copied = await inspectCli(path.join(copiedRoot, 'bin/cohub.js'));
   const after = await inspectCli(path.join(source, 'bin/cohub.js'));
   if (JSON.stringify(original) !== JSON.stringify(copied) || JSON.stringify(original) !== JSON.stringify(after))
     throw new Error(`CLI changed during snapshot; partial copy retained at ${staging}`);
   await requireAbsent(destination);
   await fs.rename(copiedRoot, destination);
-  await fs.writeFile(baseline, JSON.stringify({ schemaVersion: 1, reviewedVersion: copied.version, fingerprint: copied.fingerprint }, null, 2) + '\n',
+  await fs.writeFile(baseline, JSON.stringify({ schemaVersion: 2, reviewedVersion: copied.version, fingerprint: copied.fingerprint, contract }, null, 2) + '\n',
     { flag: 'wx', mode: 0o600 });
   await fs.rmdir(staging);
-  return { recoveryCli: path.join(destination, 'bin/cohub.js'), compatibilityFile: baseline, ...copied };
+  return { recoveryCli: path.join(destination, 'bin/cohub.js'), compatibilityFile: baseline, ...copied, contract };
 }
 
 if (process.argv[1] && await fs.realpath(process.argv[1]) === fileURLToPath(import.meta.url)) {

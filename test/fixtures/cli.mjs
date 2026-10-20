@@ -21,7 +21,9 @@ if (args[0] === 'network-env') {
 } else if (args[0] === 'auth') {
   emit({ source: 'logto', user: { profile: { logtoUserId: setup.identity.slice(5) } } });
 } else if (args[1] === 'logs') {
-  emit([{ timestamp: new Date().toISOString(), event: 'runtime.websocket.closed', data: { code: 1006, activeExecutions: 2, cmd: 'private command' } }]);
+  const o = await owner();
+  emit(setup.events ?? [{ timestamp: setup.disconnectAt ?? '2020-01-01T00:00:00Z', runtimeId: o?.runtimeId,
+    event: 'runtime.websocket.closed', data: { code: 1006, activeExecutions: 2, fatal: false, conflict: false, cmd: 'private command' } }]);
 } else if (args[1] === 'status') {
   const o = await owner();
   const running = o && alive(o.pid);

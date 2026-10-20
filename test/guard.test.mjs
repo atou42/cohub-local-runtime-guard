@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
-import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock } from '../guard.mjs';
+import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock, executionDisconnect, stateNames, CLI_CONTRACT } from '../guard.mjs';
 
 const base = () => ({ version: 1, restarts: [], checkedAt: null, candidate: null, failureSince: null });
 const failed = { kind: 'connection_stuck', runtimeId: 'runtime-a', pid: 300 };
@@ -25,6 +25,40 @@ test('only a continuous confirmed outage reaches recovery', () => {
   s = decide(s, failed, 120, false, policy);
   assert.equal(s.action, 'recover');
   assert.equal(decide(s, { kind: 'healthy' }, 150, false, policy).failureSince, null);
+});
+test('1006 acceleration rejects stale, foreign, idle, recovered and fatal diagnostics', () => {
+  const now = Date.now();
+  const sample = { ...failed };
+  const event = { timestamp: new Date(now - 100).toISOString(), runtimeId: sample.runtimeId,
+    event: 'runtime.websocket.closed', data: { code: 1006, activeExecutions: 1, fatal: false, conflict: false } };
+  assert.equal(executionDisconnect([event], sample, now).code, 1006);
+  for (const patch of [
+    { runtimeId: 'another' }, { timestamp: new Date(now - 16 * 60_000).toISOString() },
+    { timestamp: new Date(now + 1).toISOString() }, { data: { ...event.data, activeExecutions: 0 } },
+    { data: { ...event.data, fatal: true } }, { data: { ...event.data, conflict: true } },
+    { data: { ...event.data, code: 4403 } },
+  ]) assert.equal(executionDisconnect([{ ...event, ...patch }], sample, now), null);
+  for (const name of ['runtime.ready', 'runtime.websocket.rejected', 'runtime.auth_required']) {
+    const later = { ...event, timestamp: new Date(now).toISOString(), event: name };
+    assert.equal(executionDisconnect([later, event], sample, now), null);
+  }
+  assert.equal(executionDisconnect([event], { ...sample, kind: 'healthy' }, now), null);
+  assert.throws(() => executionDisconnect({}, sample), /Invalid/);
+  assert.throws(() => executionDisconnect([{ ...event, timestamp: 'broken' }], sample), /timestamp/);
+});
+test('active execution 1006 uses a short confirmation window, not the generic two minutes', () => {
+  const config = { ...policy, intervalMs: 10, executionDisconnectMs: 20 };
+  const sample = { ...failed, transportFailure: { code: 1006, activeExecutions: 1, closedAt: 0 } };
+  let state = decide(base(), sample, 0, false, config);
+  state = decide(state, sample, 10, false, config);
+  assert.equal(state.action, 'observe');
+  state = decide(state, sample, 20, false, config);
+  assert.equal(state.action, 'recover');
+  assert.equal(decide(state, { kind: 'healthy' }, 21, false, config).action, 'observe');
+  assert.equal(decide(state, sample, 21, true, config).action, 'observe');
+  assert.equal(decide({ ...state, restarts: [0] }, sample, 30, false, config).reason, 'cooldown');
+  const replaced = { ...sample, transportFailure: { ...sample.transportFailure, closedAt: 30 } };
+  assert.equal(decide(state, replaced, 30, false, config).action, 'observe');
 });
 test('network failure, permission failure and unknown ownership never trigger restart', () => {
   for (const kind of ['remote_unavailable', 'probe_error', 'config_error', 'scope_changed', 'another_runtime', 'attention']) {
@@ -116,6 +150,84 @@ async function setFixture(g, patch) {
   const f = path.join(g.config.home, 'fixture.json');
   await fs.writeFile(f, JSON.stringify({ ...await readJson(f), ...patch }));
 }
+
+test('integration: active execution 1006 restarts promptly without replay or a duplicate worker', async t => {
+  const g = await fixture(t);
+  g.config = { ...g.config, intervalMs: 10_000, executionDisconnectMs: 20, unhealthyMs: 120_000, graceMs: 30_000 };
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, disconnectAt: new Date().toISOString() });
+  const sample = await g.probe();
+  assert.equal(sample.transportFailure.code, 1006);
+  assert.equal(sample.transportFailure.activeExecutions, 2);
+  let state = decide(base(), sample, Date.now() - 25, false, g.config);
+  state = await g.tick(state);
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal((await g.probe()).kind, 'healthy');
+  assert.notEqual((await g.probe()).pid, sample.pid);
+  assert.equal(await g.processIdentity(sample.pid), null);
+  const calls = (await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(calls.filter(a => a[1] === 'down').length, 1);
+  assert.equal(calls.filter(a => a[1] === 'up').length, 2);
+  assert.ok(calls.every(a => !a.includes('prompt') && !a.includes('import')));
+});
+
+test('1006 evidence failure is visible and cannot authorize a fast restart', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, events: {} });
+  const sample = await g.probe();
+  assert.match(sample.transportEvidenceError, /Invalid Runtime diagnostics/);
+  assert.equal(sample.transportFailure, undefined);
+  assert.equal(advance(base(), sample, 0, 90).action, 'observe');
+});
+
+test('1006 recovery rechecks the same disconnect before stopping a worker', async t => {
+  const g = await fixture(t);
+  await g.cli(['runtime', 'up']);
+  await setFixture(g, { stuck: true, disconnectAt: new Date().toISOString() });
+  const sample = await g.probe();
+  assert.equal(sample.transportFailure.code, 1006);
+  await setFixture(g, { events: [] });
+  assert.deepEqual(await g.recover(sample), {
+    outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe',
+  });
+  assert.equal((await g.probe()).pid, sample.pid);
+  const calls = (await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(calls.filter(a => a[1] === 'down').length, 0);
+});
+
+test('schema 2 accepts verified versions by contract but rejects tampering and version relabeling', async t => {
+  const g = await fixture(t);
+  const baseline = { ...await readJson(g.config.compatibilityFile), schemaVersion: 2,
+    contract: { id: CLI_CONTRACT, passed: true, checkedAt: new Date().toISOString(), activeExecution1006: 'waits_for_execution' } };
+  await fs.writeFile(g.config.compatibilityFile, JSON.stringify(baseline));
+  assert.equal((await g.checkCompatibility()).verification.id, CLI_CONTRACT);
+  for (const change of [
+    { reviewedVersion: '10.6.0' },
+    { contract: { ...baseline.contract, passed: false } },
+    { contract: { ...baseline.contract, activeExecution1006: 'unknown' } },
+  ]) {
+    await fs.writeFile(g.config.compatibilityFile, JSON.stringify({ ...baseline, ...change }));
+    await assert.rejects(g.checkCompatibility());
+  }
+});
+
+test('legacy layout retains existing pause, state, cooldown and singleton lock', async t => {
+  const g = await fixture(t);
+  const legacy = new Guard({ ...g.config, stateLayout: 'legacy-zh' });
+  await legacy.init();
+  assert.equal(path.basename(legacy.stateFile), '状态.json');
+  assert.equal(path.basename(legacy.controlFile), '控制.json');
+  assert.equal(path.basename(legacy.logFile), '事件.jsonl');
+  assert.throws(() => stateNames('unknown'), /stateLayout/);
+  await fs.writeFile(legacy.controlFile, JSON.stringify({ version: 1, paused: true }));
+  await legacy.save({ ...base(), restarts: [Date.now()] });
+  assert.equal(await legacy.paused(), true);
+  assert.equal((await legacy.loadState()).restarts.length, 1);
+  const unlock = await acquireLock(g.config.directory, 'legacy-zh');
+  try { await assert.rejects(acquireLock(g.config.directory, 'legacy-zh'), /already running/); }
+  finally { await unlock(); }
+});
 
 test('integration: dead process starts once, without replaying any task', async t => {
   const g = await fixture(t);
