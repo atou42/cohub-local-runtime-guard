@@ -5,11 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
-import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock, executionDisconnect, stateNames, CLI_CONTRACT } from '../guard.mjs';
+import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, retryDelay, inspectCli, redact, readJson, rootOf, rotate, startHarnessArgs, summarizeStatus, safeRuntimeEvents, acquireLock, executionDisconnect, stateNames, CLI_CONTRACT } from '../guard.mjs';
 
 const base = () => ({ version: 1, restarts: [], checkedAt: null, candidate: null, failureSince: null });
 const failed = { kind: 'connection_stuck', runtimeId: 'runtime-a', pid: 300 };
-const policy = { ...CONFIG, intervalMs: 30, unhealthyMs: 120, cooldownMs: 600 };
+const policy = { ...CONFIG, intervalMs: 30, unhealthyMs: 120, retryBaseMs: 50, retryMaxMs: 600 };
 const advance = (state, sample, from, until, paused = false, config = policy) => {
   for (let t = from; t <= until; t += config.intervalMs) state = decide(state, sample, t, paused, config);
   return state;
@@ -25,6 +25,34 @@ test('only a continuous confirmed outage reaches recovery', () => {
   s = decide(s, failed, 120, false, policy);
   assert.equal(s.action, 'recover');
   assert.equal(decide(s, { kind: 'healthy' }, 150, false, policy).failureSince, null);
+});
+test('continuous failure retries for hours with only capped exponential backoff', () => {
+  const sample = { kind: 'process_down', pid: null, runtimeId: null };
+  const config = { ...CONFIG, unhealthyMs: 0 };
+  let clock = 1_000_000;
+  let state = { ...base(), restarts: [clock - 100, clock - 50, clock],
+    lastEscalationAt: clock };
+  for (let attempt = 1; attempt <= 200; attempt++) {
+    state = decide(state, sample, clock, false, config);
+    assert.equal(state.action, 'recover', `attempt ${attempt} must not be capped`);
+    state.retry = { attempts: attempt, lastAttemptAt: clock, candidate: state.candidate };
+    const delay = Math.min(5000 * 2 ** Math.min(attempt - 1, 4), 60000);
+    assert.equal(decide(state, sample, clock + delay - 1, false, config).reason, 'retry_backoff');
+    assert.equal(decide(state, sample, clock + delay - 1, false, config).nextEligibleAt, clock + delay);
+    clock += delay;
+  }
+  assert.ok(clock - 1_000_000 > 3 * 3_600_000);
+  assert.equal(decide(state, { kind: 'healthy' }, clock, false, config).retry, null);
+});
+test('short retries never bypass another_runtime protection', () => {
+  const config = { ...CONFIG, unhealthyMs: 0 };
+  const state = { ...base(), retry: { attempts: 100, lastAttemptAt: 0, candidate: 'process_down:absent' } };
+  for (const now of [60_000, 3_600_000, 86_400_000]) {
+    const blocked = decide(state, { kind: 'another_runtime', pid: null,
+      remoteRuntimeId: 'genuine-competitor', online: true }, now, false, config);
+    assert.equal(blocked.action, 'observe');
+    assert.equal(blocked.reason, 'another_runtime');
+  }
 });
 test('1006 acceleration rejects stale, foreign, idle, recovered and fatal diagnostics', () => {
   const now = Date.now();
@@ -56,7 +84,8 @@ test('active execution 1006 uses a short confirmation window, not the generic tw
   assert.equal(state.action, 'recover');
   assert.equal(decide(state, { kind: 'healthy' }, 21, false, config).action, 'observe');
   assert.equal(decide(state, sample, 21, true, config).action, 'observe');
-  assert.equal(decide({ ...state, restarts: [0] }, sample, 30, false, config).reason, 'cooldown');
+  assert.equal(decide({ ...state, retry: { attempts: 1, lastAttemptAt: 20, candidate: state.candidate } },
+    sample, 30, false, config).reason, 'retry_backoff');
   const replaced = { ...sample, transportFailure: { ...sample.transportFailure, closedAt: 30 } };
   assert.equal(decide(state, replaced, 30, false, config).action, 'observe');
 });
@@ -74,14 +103,17 @@ test('pause, uncertain probe, replacement Runtime and monitoring gap reset the o
   assert.equal(decide(s, { ...failed, runtimeId: 'new' }, 120, false, policy).failureSince, 120);
   assert.equal(decide(s, failed, 1000, false, policy).failureSince, 1000);
 });
-test('process death also requires confirmation, cooldown and hourly circuit breaker survive restarts', () => {
+test('process death requires initial confirmation but old hourly limits and cooldown records have no effect', () => {
   const down = { kind: 'process_down', runtimeId: null, pid: null };
   assert.equal(advance(base(), down, 0, 120).action, 'recover');
   const s = advance({ ...base(), restarts: [0] }, failed, 0, 120);
-  assert.equal(s.reason, 'cooldown');
-  assert.equal(advance(s, failed, 150, 600).action, 'recover');
-  const limited = advance({ ...base(), restarts: [0, 10, 20] }, failed, 1000, 1120);
-  assert.equal(limited.reason, 'rate_limited');
+  assert.equal(s.action, 'recover');
+  const continued = advance({ ...base(), restarts: [0, 10, 20], lastEscalationAt: 1000 }, failed, 1000, 1120);
+  assert.equal(continued.action, 'recover');
+});
+test('backoff grows from five seconds to one minute without overflow', () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 100, Number.MAX_SAFE_INTEGER].map(n => retryDelay(n)),
+    [5000, 10000, 20000, 40000, 60000, 60000, 60000, 60000]);
 });
 test('malformed status is not interpreted as offline', () => {
   assert.throws(() => summarizeStatus({}), /Invalid/);
@@ -221,7 +253,7 @@ test('schema 2 accepts verified versions by contract but rejects tampering and v
   }
 });
 
-test('legacy layout retains existing pause, state, cooldown and singleton lock', async t => {
+test('legacy layout retains existing pause, audit history and singleton lock', async t => {
   const g = await fixture(t);
   const legacy = new Guard({ ...g.config, stateLayout: 'legacy-zh' });
   await legacy.init();
@@ -449,7 +481,7 @@ test('uncertain probes do not stop or start a Runtime', async t => {
   const calls = await fs.readFile(path.join(g.config.home, 'calls.jsonl'), 'utf8');
   assert.ok(!calls.includes('"down"') && !calls.includes('"up"'));
 });
-test('tick records failures, bounded incident logs, rate limit and successful healing', async t => {
+test('tick records failures, bounded incident logs, operation history and successful healing', async t => {
   const g = await fixture(t);
   const now = Date.now();
   g.config = { ...g.config, unhealthyMs: 0 };
@@ -598,7 +630,7 @@ test('dependency changes and prerelease builds need review, unrelated command ed
   await assert.rejects(g.checkCompatibility(), /dependencies changed/);
 });
 
-test('compatibility monitoring does not execute an unreviewed CLI or spend restart cooldown', async t => {
+test('compatibility monitoring does not execute an unreviewed CLI or record a recovery operation', async t => {
   const g = await fixture(t);
   const original = await fs.readFile(g.config.worker);
   await fs.appendFile(g.config.worker, '\n// upgrade\n');
@@ -704,12 +736,21 @@ test('public configuration requires explicit scope and an independent recovery C
   assert.equal(loaded.shareScreen, false);
   assert.equal(loaded.readyHooks, false);
   assert.equal(loaded.codexShared, false);
+  const retired = { cooldownMs: 600000, maxRestartsPerHour: 3, resumeRetryMs: 30000,
+    maxResumeAttempts: 3, escalationIntervalMs: 900000, staleHeartbeatMs: 120000 };
+  await fs.writeFile(file, JSON.stringify({ ...input, ...retired }));
+  const migrated = await loadConfig(file);
+  for (const field of Object.keys(retired)) assert.equal(Object.hasOwn(migrated, field), false);
+  assert.equal(migrated.retryBaseMs, 5000);
+  assert.equal(migrated.retryMaxMs, 60000);
   await fs.writeFile(file, JSON.stringify({ ...input, codexShared: true }));
   assert.equal((await loadConfig(file)).codexShared, true);
   await assert.rejects(loadConfig(), /explicit --config/);
   for (const patch of [{ spaceId: CONFIG.spaceId }, { identity: CONFIG.identity }, { root: '~/workspace' },
     { recoveryCli: input.cli }, { harnesses: ['codex', 'codex'] }, { typo: true }, { shareScreen: 'false' }, { graceMs: 0 },
-    { codexShared: 'true' }, { codexShared: true, harnesses: ['pi'] }]) {
+    { codexShared: 'true' }, { codexShared: true, harnesses: ['pi'] },
+    { retryBaseMs: 0 }, { retryMaxMs: 60001 }, { retryBaseMs: 5000, retryMaxMs: 1000 },
+    { cooldownMs: 'broken' }]) {
     await fs.writeFile(file, JSON.stringify({ ...input, ...patch }));
     await assert.rejects(loadConfig(file));
   }
@@ -822,8 +863,10 @@ test('remote instance identity and observation time survive status projection', 
   assert.throws(() => summarizeStatus(raw), /remote Runtime/);
 });
 
-test('10-20: stopped worker waits for its old lease then resumes without cooldown or a second budget charge', async t => {
+test('10-20: a stopped worker retries its own stale lease under the same recovery operation', async t => {
   const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   g.remoteRecord = async () => null;
   await g.cli(['runtime', 'up']);
@@ -838,46 +881,47 @@ test('10-20: stopped worker waits for its old lease then resumes without cooldow
     return result;
   };
   let state = await g.tick(base());
-  assert.equal(state.pendingRecovery.phase, 'awaiting_start');
+  assert.equal(state.pendingRecovery.phase, 'starting');
   assert.equal(state.restarts.length, 1);
-  assert.equal(state.lastRecovery.reason, 'waiting_previous_lease');
+  assert.equal(state.lastRecovery.outcome, 'failed');
   const operationId = state.pendingRecovery.id;
   state = await g.tick(await g.loadState());
-  assert.equal(state.reason, 'waiting_previous_lease');
+  assert.equal(state.reason, 'retry_backoff');
+  assert.equal(state.pendingRecovery.id, operationId);
+  clock = state.nextEligibleAt;
+  state = await g.tick(await g.loadState());
+  assert.equal(state.lastRecovery.outcome, 'failed');
+  assert.equal(state.pendingRecovery.attempts, 2);
   assert.equal(state.pendingRecovery.id, operationId);
   await setFixture(g, { remote: null });
-  state.pendingRecovery.nextAttemptAt = Date.now() - 1;
+  clock = state.nextEligibleAt;
   state = await g.tick(state);
   assert.equal(state.lastRecovery.outcome, 'recovered');
   assert.equal(state.restarts.length, 1);
   assert.equal(state.pendingRecovery, null);
   assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 1);
-  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 4);
 });
 
-test('10-20: exhausted normal budget has a slower stale-disconnect escalation, not an unconditional override', () => {
+test('10-20: old exhausted budgets no longer stop a disconnected runtime, even without heartbeat evidence', () => {
   const now = Date.parse('2026-10-20T09:35:37Z');
   const restarts = ['08:56:25.321', '09:10:03.193', '09:20:18.574'].map(s => Date.parse(`2026-10-20T${s}Z`));
   const sample = { ...staleOffline(now), transportFailure: { code: 1006, activeExecutions: 1, closedAt: now - 32_000 } };
   const first = decide({ ...base(), restarts }, sample, now - 25_000, false, CONFIG);
   const state = decide(first, sample, now, false, CONFIG);
   assert.equal(state.action, 'recover');
-  assert.equal(state.reason, 'stale_disconnect_escalation');
+  assert.equal(state.reason, 'connection_stuck');
   const again = decide({ ...state, lastEscalationAt: now }, sample, now + 10_000, false, CONFIG);
-  assert.equal(again.action, 'observe');
-  assert.equal(again.nextEligibleAt, now + CONFIG.escalationIntervalMs);
+  assert.equal(again.action, 'recover');
   for (const patch of [
-    { remoteRuntimeId: 'genuine-other' },
-    { remoteWorkspaceOnline: true },
-    { online: true },
-    { remoteRecord: { ...sample.remoteRecord, provider: 'cloud' } },
-    { remoteRecord: { ...sample.remoteRecord, status: 'running' } },
-    { remoteRecord: { ...sample.remoteRecord, stopReason: 'user' } },
+    { remoteRecord: null },
     { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: new Date(now).toISOString() } },
     { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: 'broken' } },
     { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: null } },
     { remoteRecord: { ...sample.remoteRecord, lastHeartbeatAt: new Date(now + 1000).toISOString() } },
-  ]) assert.equal(decide(first, { ...sample, ...patch }, now, false, CONFIG).action, 'observe');
+  ]) assert.equal(decide(first, { ...sample, ...patch }, now, false, CONFIG).action, 'recover');
+  assert.equal(decide(first, { ...sample, kind: 'another_runtime', remoteRuntimeId: 'genuine-other' },
+    now, false, CONFIG).action, 'observe');
 });
 
 const reopenGuard = g => Object.assign(new Guard(g.config), {
@@ -919,7 +963,7 @@ test('pending stop survives a guard interruption and completion is charged once'
   const id = state.pendingRecovery.id;
   assert.equal(await g.processIdentity(state.pendingRecovery.sourcePid), null);
   const restarted = reopenGuard(g);
-  clock += CONFIG.resumeRetryMs;
+  clock = state.nextEligibleAt;
   state = await restarted.tick(await restarted.loadState());
   assert.equal(state.lastRecovery.outcome, 'recovered');
   assert.equal(state.lastRecovery.operationId, id);
@@ -990,7 +1034,7 @@ test('pause, unavailable proxy and failed consent preserve the pending operation
   await setFixture(g, { failStart: true });
   let state = await g.tick(base());
   const pendingId = state.pendingRecovery.id;
-  clock += CONFIG.resumeRetryMs;
+  clock = state.nextEligibleAt;
   await fs.writeFile(g.controlFile, JSON.stringify({ version: 1, paused: true }));
   state = await g.tick(state);
   assert.equal(state.reason, 'paused');
@@ -1010,39 +1054,106 @@ test('pause, unavailable proxy and failed consent preserve the pending operation
   assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
 });
 
-test('failed starts have bounded same-operation retries, then spaced and revalidated escalations', async t => {
+test('failed starts keep retrying for over an hour across guard restarts with a one-minute ceiling', async t => {
   const g = await fixture(t);
   let clock = Date.now();
   g.now = () => clock;
   g.notify = () => {};
   g.config = { ...g.config, unhealthyMs: 0 };
-  await setFixture(g, { failStart: true, remoteRecord: disconnectedRecord(clock) });
+  // No stale-heartbeat proof is required to continue an already confirmed outage.
+  g.remoteRecord = async () => null;
+  await setFixture(g, { failStart: true });
+  const began = clock;
   let state = await g.tick(base());
   const id = state.pendingRecovery.id;
-  for (let i = 0; i < 2; i++) {
-    clock += CONFIG.resumeRetryMs;
-    state = await g.tick(await g.loadState());
+  for (let attempt = 2; attempt <= 67; attempt++) {
+    const deadline = state.nextEligibleAt;
+    assert.equal(deadline - clock, retryDelay(attempt - 1));
+    if (attempt <= 7) {
+      clock = deadline - 1;
+      state = await g.tick(await g.loadState());
+      assert.equal(state.action, 'observe');
+      assert.equal(state.reason, 'retry_backoff');
+      assert.equal(state.pendingRecovery.attempts, attempt - 1);
+    }
+    clock = deadline;
+    const runner = attempt % 10 === 0 ? reopenGuard(g) : g;
+    state = await runner.tick(await runner.loadState());
+    assert.equal(state.lastRecovery.outcome, 'failed');
+    assert.equal(state.pendingRecovery.attempts, attempt);
+    assert.equal(state.pendingRecovery.id, id);
+    assert.equal(state.nextEligibleAt - clock, retryDelay(attempt));
   }
-  assert.equal(state.pendingRecovery.attempts, 3);
-  assert.equal(state.pendingRecovery.id, id);
+  assert.ok(clock - began > 3_600_000);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 67);
   assert.equal(state.restarts.length, 1);
-  clock += CONFIG.resumeRetryMs;
-  state = await g.tick(state);
-  assert.equal(state.action, 'observe');
-  assert.equal(state.reason, 'resume_retry_limited');
+  await setFixture(g, { failStart: false });
   clock = state.nextEligibleAt;
-  state = await g.tick(await g.loadState());
-  assert.equal(state.pendingRecovery.attempts, 4);
-  assert.equal(state.restarts.length, 1);
-  assert.equal(state.lastEscalationAt, clock);
-  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 4);
-  clock += CONFIG.resumeRetryMs;
   state = await reopenGuard(g).tick(await g.loadState());
-  assert.equal(state.action, 'observe');
-  assert.equal(state.nextEligibleAt, state.lastEscalationAt + CONFIG.escalationIntervalMs);
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal(state.retry, null);
+  assert.equal(state.pendingRecovery, null);
+  assert.equal(state.nextEligibleAt, null);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 68);
 });
 
-test('escalation rechecks heartbeat and identity immediately before any destructive command', async t => {
+test('legacy pending escalation deadlines are replaced by short retries without discarding the journal', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  g.config = { ...g.config, unhealthyMs: 0 };
+  await setFixture(g, { failStart: true });
+  const state = await g.tick(base());
+  const id = state.pendingRecovery.id;
+  delete state.retry;
+  state.lastEscalationAt = clock;
+  Object.assign(state.pendingRecovery, { mode: 'escalated', attempts: 8,
+    lastAttemptAt: clock, nextAttemptAt: clock + 900_000 });
+  await g.save(state);
+  const restarted = reopenGuard(g);
+  clock += 59_999;
+  let after = await restarted.tick(await restarted.loadState());
+  assert.equal(after.reason, 'retry_backoff');
+  assert.equal(after.nextEligibleAt, clock + 1);
+  clock++;
+  after = await restarted.tick(await restarted.loadState());
+  assert.equal(after.lastRecovery.outcome, 'failed');
+  assert.equal(after.pendingRecovery.id, id);
+  assert.equal(after.pendingRecovery.attempts, 9);
+  assert.equal(after.nextEligibleAt, clock + 60_000);
+  assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
+});
+
+test('slow recovery failures without a pending start use completion-based backoff, not another confirmation window', async t => {
+  const g = await fixture(t);
+  let clock = Date.now();
+  g.now = () => clock;
+  const attempts = [];
+  g.recover = async () => {
+    attempts.push(clock);
+    clock += 120_000;
+    throw new Error('Synthetic slow failure before a mutating command');
+  };
+  let state = await g.tick({ ...base(), checkedAt: clock, candidate: 'process_down:absent',
+    failureSince: clock - CONFIG.unhealthyMs });
+  assert.equal(state.lastRecovery.outcome, 'deferred');
+  assert.equal(state.nextEligibleAt, clock + 5000);
+  assert.equal(state.pendingRecovery, undefined);
+  const restarted = reopenGuard(g);
+  restarted.recover = g.recover;
+  clock = state.nextEligibleAt - 1;
+  state = await restarted.tick(await restarted.loadState());
+  assert.equal(state.reason, 'retry_backoff');
+  assert.equal(attempts.length, 1);
+  clock++;
+  state = await restarted.tick(await restarted.loadState());
+  assert.equal(attempts.length, 2);
+  assert.equal(state.retry.attempts, 2);
+  assert.equal(state.nextEligibleAt, clock + 10_000);
+  assert.ok((await calls(g)).every(a => !['up', 'down'].includes(a[1])));
+});
+
+test('retry rechecks actual instance identity before any destructive command', async t => {
   const g = await fixture(t);
   const now = Date.now();
   g.now = () => now;
@@ -1051,17 +1162,17 @@ test('escalation rechecks heartbeat and identity immediately before any destruct
   const state = { ...base(), restarts: [now - 2_000_000, now - 1_500_000, now - 1_000_000] };
   let count = 0;
   g.probe = async () => ++count === 1 ? old : {
-    ...old, remoteRecord: { ...old.remoteRecord, lastHeartbeatAt: new Date(now).toISOString() },
+    ...old, kind: 'another_runtime', remoteRuntimeId: 'genuine-competitor',
   };
   const after = await g.tick(state);
   assert.equal(after.lastRecovery.outcome, 'skipped');
-  assert.match(after.lastRecovery.reason, /evidence changed/);
+  assert.match(after.lastRecovery.reason, /Runtime changed/);
   assert.deepEqual(after.restarts, state.restarts);
   assert.equal(after.lastEscalationAt, undefined);
   assert.ok((await calls(g)).every(a => !['down', 'up'].includes(a[1])));
 });
 
-test('an escalation that starts a replacement persists its budget and survives guard restart', async t => {
+test('successful recovery ignores legacy limits and clears backoff before a subsequent outage', async t => {
   const g = await fixture(t);
   let clock = Date.now();
   g.now = () => clock;
@@ -1069,17 +1180,19 @@ test('an escalation that starts a replacement persists its budget and survives g
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, remoteRecord: disconnectedRecord(clock) });
   const before = await g.probe();
-  let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000] });
-  assert.equal(state.lastRecovery.mode, 'escalated');
+  let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000],
+    lastEscalationAt: clock });
+  assert.equal(state.lastRecovery.mode, 'normal');
   assert.equal(state.lastRecovery.outcome, 'recovered');
   assert.equal(state.restarts.length, 4);
-  assert.equal(state.lastEscalationAt, clock);
+  assert.equal(state.retry, null);
   assert.equal(await g.processIdentity(before.pid), null);
   await setFixture(g, { stuck: true });
-  clock += CONFIG.cooldownMs + 1;
+  clock += CONFIG.retryBaseMs;
   state = await reopenGuard(g).tick(await g.loadState());
-  assert.equal(state.action, 'observe');
-  assert.equal(state.reason, 'escalation_cooldown');
+  assert.equal(state.action, 'recover');
+  assert.equal(state.lastRecovery.outcome, 'recovered');
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 2);
 });
 
 test('a successful startup followed by an unavailable probe does not cause a duplicate startup', async t => {
@@ -1106,12 +1219,15 @@ test('a successful startup followed by an unavailable probe does not cause a dup
   assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 1);
 });
 
-test('malformed recovery journals are retained and never reset into a new budget', async t => {
+test('malformed recovery journals and retry records are retained', async t => {
   const g = await fixture(t);
   for (const bad of [
     { pendingRecovery: { phase: 'awaiting_start' } },
     { lastEscalationAt: 'yesterday' },
-    { lastNotice: { key: 'rate_limited', at: null } },
+    { lastNotice: { key: 'recovery_conflict', at: null } },
+    { retry: { attempts: -1, lastAttemptAt: 0, candidate: 'process_down:absent' } },
+    { retry: { attempts: 1, lastAttemptAt: 'broken', candidate: 'process_down:absent' } },
+    { retry: { attempts: 1, lastAttemptAt: 0 } },
   ]) {
     const text = JSON.stringify({ ...base(), ...bad });
     await fs.writeFile(g.stateFile, text);
@@ -1120,29 +1236,34 @@ test('malformed recovery journals are retained and never reset into a new budget
   }
 });
 
-test('limit notices include retry time and survive restarts without notifying on every poll', async t => {
+test('instance conflict notices survive restarts without notifying on every poll', async t => {
   const g = await fixture(t);
   let clock = Date.now();
   g.now = () => clock;
   g.config = { ...g.config, unhealthyMs: 0 };
-  const sample = { ...failed, online: false, remoteRuntimeId: 'runtime-a', remoteWorkspaceOnline: false };
+  const sample = { kind: 'another_runtime', pid: null, runtimeId: null,
+    online: true, remoteRuntimeId: 'genuine-competitor', remoteWorkspaceOnline: true };
   g.probe = async () => sample;
   const notices = [];
   g.notify = n => notices.push(n);
   let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000] });
-  assert.equal(state.reason, 'rate_limited');
+  assert.equal(state.reason, 'another_runtime');
   assert.equal(notices.length, 1);
-  assert.equal(notices[0].nextEligibleAt, state.restarts[0] + 3_600_000);
-  assert.equal(notices[0].remoteRuntimeId, 'runtime-a');
+  assert.equal(notices[0].nextEligibleAt, null);
+  assert.equal(notices[0].remoteRuntimeId, 'genuine-competitor');
   clock += CONFIG.intervalMs;
-  state = await g.tick(await g.loadState());
+  const restarted = reopenGuard(g);
+  restarted.probe = g.probe;
+  restarted.notify = g.notify;
+  state = await restarted.tick(await restarted.loadState());
   assert.equal(notices.length, 1);
-  clock += CONFIG.escalationIntervalMs;
-  state = await g.tick({ ...await g.loadState(), checkedAt: clock - CONFIG.intervalMs });
+  clock += 60_000;
+  state = await restarted.tick(await restarted.loadState());
   assert.equal(notices.length, 2);
+  assert.ok((await calls(g)).every(a => !['up', 'down'].includes(a[1])));
 });
 
-test('10-20 timeline replay: fixing split accounting leaves room for the 17:35 fast recovery', () => {
+test('10-20 timeline replay: previous recoveries never block the 17:35 fast recovery', () => {
   const at = time => Date.parse(`2026-10-20T${time}+08:00`);
   let state = base();
   const sample = { ...failed, transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('16:55:41') } };

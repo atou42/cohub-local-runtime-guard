@@ -1,14 +1,14 @@
 # Cohub Local Runtime Guard
 
-A small, dependency-free watchdog for an existing [Cohub](https://cohub.live) Local Runtime. It detects sustained disconnection or process death, saves diagnostic evidence, and attempts a bounded restart without deleting conversation history or replaying prompts.
+A small, dependency-free watchdog for an existing [Cohub](https://cohub.live) Local Runtime. It detects sustained disconnection or process death, saves diagnostic evidence, and keeps attempting recovery with short exponential backoff without deleting conversation history or replaying prompts.
 
 This is an independent recovery tool, not an official Cohub component and not a fix for the client's internal reconnect behavior. **Restarting a Runtime can interrupt its tasks.** It does not use reset operations or reset credits.
 
 ## Recovery Policy
 
-- Check every 10 seconds; require two minutes of continuously confirmed failure before recovery.
+- Check every 10 seconds; require two minutes of continuously confirmed failure before the first recovery. Wake earlier when a short retry becomes due.
 - For a current Runtime's abnormal WebSocket close (`1006`) with active executions, require only 20 seconds of continuously confirmed disconnection. Pause, network, ownership and consent checks still apply. Missing, stale, malformed or superseded diagnostic evidence cannot authorize the shorter window.
-- Normally allow three recovery operations per hour, with a ten-minute cooldown. A stopped worker's pending startup continues the same operation without a second budget charge. A separately spaced stale-disconnect escalation is described below. All records survive guard restarts.
+- There is no hourly recovery cap, retry-count ceiling, long cooldown or `rate_limited` stop state. After a failed attempt, wait 5, 10, 20, 40, then at most 60 seconds between attempts, indefinitely while the outage remains recoverable. Retry state survives guard restarts and resets on verified health.
 - Do not restart on an ambiguous API timeout, changed account or consent, malformed state, or another Runtime owning the Space.
 - Stop gracefully first. After a 30-second grace period, force-stop only a verified Runtime parent with unchanged ownership and no remaining child processes. Never signal an entire process group.
 - Keep state, conversation history, native logs and task outputs. Never clear corrupted state to make a check pass.
@@ -58,7 +58,7 @@ Screen sharing and workspace-ready hooks are **off by default**. Set `shareScree
 
 With `codexShared: true`, each monitor cycle also checks the configured home's `.codex/app-server-control/app-server-control.sock` and validates `codex app-server daemon version`. The socket may be a symlink to Codex's short socket path; its target must be a socket owned by the current user. This interface was checked with Codex 0.163.0 on macOS. Custom `CODEX_HOME` layouts are not supported by this guard.
 
-If the socket is missing or refuses connections for two continuously observed minutes, the guard calls the idempotent `codex app-server daemon start` and verifies the result. This shares the normal pause, cooldown and hourly recovery limits. Recovering only the shared daemon does not stop an otherwise healthy Runtime. When the Runtime itself needs recovery, its already-running shared app-server is preserved.
+If the socket is missing or refuses connections for two continuously observed minutes, the guard calls the idempotent `codex app-server daemon start` and verifies the result. This shares the normal pause and short retry backoff, with no hourly limit. Recovering only the shared daemon does not stop an otherwise healthy Runtime. When the Runtime itself needs recovery, its already-running shared app-server is preserved.
 
 The guard never stops, restarts or upgrades the shared daemon, changes provider/model settings, replays prompts or imports history. Permission errors, timeouts, malformed replies, ownership changes and non-socket control paths remain visible failures; they do not authorize cleanup or forced restarts. A hung but still-present shared daemon therefore needs investigation rather than automatic termination.
 
@@ -161,26 +161,26 @@ Incident snapshots select connection/heartbeat/lease fields and make credential-
 
 Optional `readyHooks: true` dispatches existing `.cohub/hooks/*.json` workspace-ready commands once per observed Runtime ID. It may run commands as your account via the configured Space. Enable it only for hooks you trust. It is not exactly-once delivery across crashes and is not prompt replay; YAML, symlinks and turn-finalized hooks are not dispatched.
 
-## Recovery Transactions and Escalation
+## Recovery Transactions and Retries
 
 The 2026-10-20 failure involved a successful stop followed by `another_runtime`: the old remote lease could still appear online after the local process exited. The former implementation abandoned startup, spent another operation on the later start, and exhausted the hourly budget. The guard now journals the operation before its first side effect, including scope, original PID, process identity, owner nonce, phase, attempts and retry time.
 
-A matching old remote lease is observed until it disappears; the guard does not steal it. A different remote instance blocks continuation, including a different offline identity during pending recovery. Once ownership and offline status are verified, startup resumes under the original budget entry. A guard interruption or an uncertain startup response cannot authorize killing a replacement process or blindly starting a duplicate. Corrupt journals fail closed and are preserved.
+A lease matching the journaled original Runtime does not permanently block recovery once its original process is verified gone. The guard retries ordinary startup under the same operation, with backoff if the server still rejects the old lease; it does not force lease takeover. A different remote instance blocks continuation, including a different offline identity during pending recovery. Ownership, original process identity and owner nonce are checked again before mutation. A guard interruption or an uncertain startup response cannot authorize killing a replacement process or blindly starting a duplicate. Corrupt journals fail closed and are preserved.
 
 Default policy (optional configuration fields):
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `resumeRetryMs` | 30000 | Minimum spacing between same-operation retries |
-| `maxResumeAttempts` | 3 | Mutating recovery invocations before requiring the slower escalation lane |
-| `escalationIntervalMs` | 900000 | Minimum escalation spacing; must exceed `cooldownMs` |
-| `staleHeartbeatMs` | 120000 | Minimum age of the authoritative remote heartbeat |
+| `retryBaseMs` | 5000 | Initial retry delay |
+| `retryMaxMs` | 60000 | Maximum retry delay; cannot exceed 60000 |
 
-An escalation requires **all** of: main and workspace offline, no conflicting remote identity, a local-provider lifecycle record with `status=stopped`, `stopReason=disconnected`, and an expired valid `lastHeartbeatAt`. If present, `runtimeStatus` must also be stopped/disconnected. The record is fetched read-only through the reviewed CLI's client/SDK in a bounded child process using the same proxy settings. `observedAt` is logged but is not treated as a heartbeat. Missing, malformed, future-dated or unavailable evidence never enables escalation.
+The delay doubles after each unsuccessful recovery invocation and is capped at `retryMaxMs`. The deadline is persisted before recovery and updated from completion, so a slow failing command cannot cause a tight retry loop. The initial outage-confirmation window is not added again to every retry of the same confirmed outage. Probe and command execution time is additional to the delay. Successful recovery or a later healthy observation clears backoff; audit history is retained.
 
-When normal limits are exhausted, eligible outages can receive one additional operation after the longer interval since the last operation/escalation. Repeated pending-start failures also fall back to this slower, revalidated lane after the retry allowance. Failed attempts consume their records; success does not erase history. Pause, CLI compatibility, native consent, account checks, process identity and network checks are never bypassed. A stale-disconnect decision is rechecked before stopping and starting. Fast 1006 detection therefore does not promise an unconditional restart every 20 seconds.
+Old configuration fields `cooldownMs`, `maxRestartsPerHour`, `resumeRetryMs`, `maxResumeAttempts`, `escalationIntervalMs` and `staleHeartbeatMs` are accepted when well-formed but discarded, so an existing installation does not need a configuration rewrite. Old restart histories and escalation timestamps impose no delay or quota. Pending operations from older releases use the new capped delay, not their old retry deadlines.
 
-`health` events retain remote runtime ID, workspace state, observation time and projected lifecycle evidence. `startup_probe` captures the stop/start boundary. `recovery_blocked` includes the reason and next eligible time (or null when release of a conflicting lease is required), is written to the event log and stderr, and repeats at most once per escalation interval for the same reason/instance. The notice marker survives guard restarts; no external notification service is installed.
+Stopped/disconnected records and missing heartbeat evidence do not impose an additional retry gate. Remote lifecycle fields remain read-only diagnostics, fetched through the reviewed CLI's client in a bounded child process using the same proxy settings. The normal status probe must still establish a recoverable outage; ambiguous API failures are not inferred to mean offline. Pause, CLI compatibility, native consent, account, process identity, network and genuine duplicate-instance checks are never bypassed.
+
+`health` events retain remote runtime ID, workspace state, observation time, projected lifecycle evidence and `nextEligibleAt`. `retry_backoff` means a scheduled retry, not a stopped recovery policy. `startup_probe` captures the stop/start boundary. `recovery_blocked` reports conflicting instances to the event log and stderr, repeating at most once per minute for the same reason/instance. The notice marker survives guard restarts; no external notification service is installed.
 
 The 18:20 forced-stop failure is also covered: a defunct/zombie `ps` entry after SIGKILL is no longer misclassified as a live unapproved worker. Post-kill checks track the original identity rather than signalling a reused PID. An independently verified, healthy replacement is adopted without another start; process-inspection errors, live unrelated owners and unverified replacements still block mutation.
 
@@ -192,9 +192,9 @@ These changes modify the guard, not CLI 10.6.0's connection loop. No task is rep
 npm test
 ```
 
-Tests use temporary directories, synthetic CLI replies and isolated Node workers. Locked-install tests use `tar` and real offline `npm ci` with a private synthetic package cache; they check exact dependency restoration, disabled install hooks, byte-level mismatch rejection, failed installs and publication rollback. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes active-execution `1006` fast recovery with one replacement worker and no prompt replay, rejection of stale/foreign/fatal/recovered diagnostics, schema 2 verification failures, legacy state preservation, shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, cooldowns, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery. Run the separate candidate verifier above against each reviewed CLI release; `npm test` does not require an installed Cohub CLI.
+Tests use temporary directories, synthetic CLI replies and isolated Node workers. Locked-install tests use `tar` and real offline `npm ci` with a private synthetic package cache; they check exact dependency restoration, disabled install hooks, byte-level mismatch rejection, failed installs and publication rollback. Local transport tests additionally start real loopback HTTP/CONNECT proxies, TLS servers and Unix sockets; `openssl` is used only to generate an ephemeral test certificate. They do not contact a real Space, start a model, intentionally disconnect a production Runtime, or call reset. Coverage includes active-execution `1006` fast recovery with one replacement worker and no prompt replay, rejection of stale/foreign/fatal/recovered diagnostics, schema 2 verification failures, legacy state preservation, shared-mode consent matching, shared-daemon recovery without stopping the Runtime, socket symlinks, malformed daemon replies, failed starts, pause, malformed data, ownership changes, child-process protection, short backoff, global CLI replacement between stop and start, damaged reviewed copies, route changes, proxy authentication/recovery, CONNECT timeouts, `NO_PROXY`, certificate rejection and explicitly trusted CA recovery. Run the separate candidate verifier above against each reviewed CLI release; `npm test` does not require an installed Cohub CLI.
 
-Additional regressions replay the October 20 split-accounting timeline and the later forced-stop failure, including old-lease waiting, interrupted transactions, competing instances, exhausted retry budgets, stale-heartbeat escalation and its recheck, persistent notices, successful-but-unobserved startup, zombie exit observations and adoption of a verified replacement.
+Additional regressions replay the October 20 split-accounting timeline and the later forced-stop failure, including own-lease retries, interrupted transactions, competing instances, persistent notices, successful-but-unobserved startup, zombie exit observations and adoption of a verified replacement. Retry tests cover over an hour of consecutive failed CLI starts with simulated time and guard restarts, a policy replay exceeding three hours, exponential growth and its one-minute ceiling, legacy-limit removal, eventual recovery and reset, and continued protection against `another_runtime`.
 
 ## License
 

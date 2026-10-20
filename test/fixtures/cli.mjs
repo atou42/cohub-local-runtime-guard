@@ -43,6 +43,10 @@ if (args[0] === 'network-env') {
     emit({ stopped: !alive(o.pid) });
   } else emit({ stopped: true });
 } else if (args[1] === 'up') {
+  if (setup.remote?.online) {
+    console.error('another_runtime');
+    process.exit(1);
+  }
   if (setup.failStart) {
     console.error('Synthetic start failure');
     process.exit(1);

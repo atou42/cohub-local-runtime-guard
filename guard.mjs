@@ -30,12 +30,8 @@ export const CONFIG = Object.freeze({
   shareScreen: false,
   unhealthyMs: 120_000,
   executionDisconnectMs: 20_000,
-  cooldownMs: 600_000,
-  maxRestartsPerHour: 3,
-  resumeRetryMs: 30_000,
-  maxResumeAttempts: 3,
-  escalationIntervalMs: 900_000,
-  staleHeartbeatMs: 120_000,
+  retryBaseMs: 5_000,
+  retryMaxMs: 60_000,
   graceMs: 30_000,
   // Optional: dispatch existing workspace-ready JSON hooks once per Runtime instance.
   readyHooks: false,
@@ -67,14 +63,21 @@ export async function loadConfig(file) {
   if (process.platform === 'win32') throw new Error('Windows process supervision is not supported');
   const input = await readJson(path.resolve(file));
   if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Invalid guard configuration');
+  // Read old deployed configurations without retaining their removed recovery limits.
+  const retired = ['cooldownMs', 'maxRestartsPerHour', 'resumeRetryMs', 'maxResumeAttempts',
+    'escalationIntervalMs', 'staleHeartbeatMs'];
   const fields = ['home', 'root', 'spaceId', 'identity', 'node', 'cli', 'recoveryCli', 'compatibilityFile',
     'directory', 'harnesses', 'codex', 'pi', 'codexShared', 'shareScreen', 'readyHooks', 'intervalMs', 'probeTimeoutMs',
-    'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs', 'stateLayout',
-    'resumeRetryMs', 'maxResumeAttempts', 'escalationIntervalMs', 'staleHeartbeatMs'];
+    'unhealthyMs', 'executionDisconnectMs', 'graceMs', 'stateLayout', 'retryBaseMs', 'retryMaxMs', ...retired];
   for (const key of Object.keys(input)) if (!fields.includes(key)) throw new Error(`Unknown configuration field: ${key}`);
   for (const key of ['root', 'spaceId', 'identity', 'cli', 'recoveryCli', 'compatibilityFile', 'directory', 'harnesses'])
     if (!Object.hasOwn(input, key)) throw new Error(`Missing configuration field: ${key}`);
   const config = { ...CONFIG, ...input };
+  for (const key of retired) {
+    if (Object.hasOwn(input, key) && (!Number.isSafeInteger(input[key]) || input[key] <= 0))
+      throw new Error(`Retired configuration field ${key} must be a positive integer when present`);
+    delete config[key];
+  }
   if (typeof config.spaceId !== 'string' || !config.spaceId.trim() || config.spaceId === CONFIG.spaceId ||
       typeof config.identity !== 'string' || !/^prod:[^\s]+$/.test(config.identity) || config.identity === CONFIG.identity)
     throw new Error('Provide the actual production Space ID and prod:<logtoUserId> identity');
@@ -97,11 +100,10 @@ export async function loadConfig(file) {
     throw new Error('Shared Codex control requires the codex harness');
   if (config.shareScreen && process.platform !== 'darwin') throw new Error('Screen sharing is supported only on macOS');
   stateNames(config.stateLayout);
-  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'cooldownMs', 'maxRestartsPerHour', 'graceMs',
-    'resumeRetryMs', 'maxResumeAttempts', 'escalationIntervalMs', 'staleHeartbeatMs'])
+  for (const key of ['intervalMs', 'probeTimeoutMs', 'unhealthyMs', 'executionDisconnectMs', 'graceMs', 'retryBaseMs', 'retryMaxMs'])
     if (!Number.isSafeInteger(config[key]) || config[key] <= 0) throw new Error(`Configuration field ${key} must be a positive integer`);
-  if (config.escalationIntervalMs <= config.cooldownMs)
-    throw new Error('Escalation interval must be longer than the normal cooldown');
+  if (config.retryBaseMs > config.retryMaxMs || config.retryMaxMs > 60_000)
+    throw new Error('Retry backoff must satisfy retryBaseMs <= retryMaxMs <= 60000');
   config.worker = path.resolve(path.dirname(config.cli), '../dist/runtime/worker.js');
   return Object.freeze(config);
 }
@@ -271,16 +273,9 @@ export function startHarnessArgs(config) {
   return args;
 }
 
-export function staleDisconnected(sample, now, config, operation = null) {
-  const record = sample.remoteRecord;
-  const expectedId = sample.runtimeId ?? operation?.sourceRuntimeId;
-  const heartbeat = typeof record?.lastHeartbeatAt === 'string' ? Date.parse(record.lastHeartbeatAt) : NaN;
-  return ['connection_stuck', 'process_down'].includes(sample.kind) && sample.online === false &&
-    sample.remoteWorkspaceOnline === false && !sample.remoteError &&
-    (sample.remoteRuntimeId === null || (expectedId && sample.remoteRuntimeId === expectedId)) &&
-    record?.provider === 'local' && record.status === 'stopped' && record.stopReason === 'disconnected' &&
-    (record.runtimeStatus == null || ['stopped', 'disconnected'].includes(record.runtimeStatus)) &&
-    Number.isFinite(heartbeat) && heartbeat >= 0 && now - heartbeat >= config.staleHeartbeatMs;
+export function retryDelay(attempts, config = CONFIG) {
+  return Math.min(config.retryMaxMs, config.retryBaseMs *
+    2 ** Math.min(Math.max(0, attempts - 1), Math.ceil(Math.log2(config.retryMaxMs / config.retryBaseMs))));
 }
 
 export function decide(previous, sample, now, paused, config = CONFIG) {
@@ -296,55 +291,38 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
   next.action = 'observe';
   next.reason = paused ? 'paused' : sample.kind;
   const pending = previous.pendingRecovery;
+  if (sample.kind === 'healthy') next.retry = null;
+  // Old journals may contain a 15-minute nextAttemptAt. Recompute only the short delay.
+  const retry = next.retry ?? pending;
+  const retryAt = retry ? retry.lastAttemptAt + retryDelay(retry.attempts, config) : null;
   if (pending && !paused) {
-    if (sample.kind === 'another_runtime' && !sample.pid && sample.remoteRuntimeId === pending.sourceRuntimeId) {
-      next.reason = 'waiting_previous_lease';
-      return next;
-    }
-    if (sample.kind === 'another_runtime' || (sample.remoteRuntimeId && sample.remoteRuntimeId !== pending.sourceRuntimeId &&
+    const ownLease = sample.kind === 'another_runtime' && !sample.pid && pending.sourcePid &&
+      sample.remoteRuntimeId === pending.sourceRuntimeId;
+    if ((!ownLease && sample.kind === 'another_runtime') || (sample.remoteRuntimeId && sample.remoteRuntimeId !== pending.sourceRuntimeId &&
         sample.remoteRuntimeId !== sample.runtimeId)) {
       next.reason = 'recovery_conflict';
       return next;
     }
-    if (recoverable && (!sample.pid || (sample.pid === pending.sourcePid && sample.runtimeId === pending.sourceRuntimeId))) {
-      const limited = pending.attempts >= config.maxResumeAttempts;
-      next.nextEligibleAt = limited
-        ? Math.max(pending.lastAttemptAt, previous.lastEscalationAt ?? 0) + config.escalationIntervalMs
-        : pending.nextAttemptAt;
-      next.reason = limited ? 'resume_retry_limited' : 'resume_wait';
-      if (now >= next.nextEligibleAt && (!limited || staleDisconnected(sample, now, config, pending))) {
+    if (ownLease || (recoverable && (!sample.pid || (sample.pid === pending.sourcePid && sample.runtimeId === pending.sourceRuntimeId)))) {
+      if (ownLease) next.candidate = `process_down:${pending.sourceRuntimeId}`;
+      next.nextEligibleAt = retryAt;
+      next.reason = 'retry_backoff';
+      if (now >= retryAt) {
         next.action = 'recover';
-        next.reason = limited ? 'stale_disconnect_escalation' : 'resume_recovery';
-        next.recoveryMode = limited ? 'escalated' : 'resume';
+        next.reason = 'resume_recovery';
+        next.recoveryMode = 'resume';
       }
       return next;
     }
     return next;
   }
   const confirmationMs = fast ? Math.min(config.unhealthyMs, config.executionDisconnectMs) : config.unhealthyMs;
-  if (!key || paused || now - next.failureSince < confirmationMs) return next;
-  const last = previous.restarts.at(-1);
-  const window = previous.restarts.filter(t => now - t < 3_600_000).sort((a, b) => a - b);
-  if (last !== undefined && now - last < config.cooldownMs) next.reason = 'cooldown';
-  else if (window.length >= config.maxRestartsPerHour) next.reason = 'rate_limited';
-  else { next.action = 'recover'; next.reason = sample.kind; next.recoveryMode = 'normal'; }
-  // A separate, slower lane is available only with fresh, authoritative offline evidence.
-  const escalationAt = Math.max(last ?? 0, previous.lastEscalationAt ?? 0) + config.escalationIntervalMs;
-  if (next.action !== 'recover') {
-    const normalAt = Math.max(now, (last ?? -config.cooldownMs) + config.cooldownMs,
-      window.length >= config.maxRestartsPerHour ? window[window.length - config.maxRestartsPerHour] + 3_600_000 : 0);
-    next.nextEligibleAt = normalAt;
-    if (staleDisconnected(sample, now, config)) {
-      next.nextEligibleAt = Math.min(normalAt, escalationAt);
-      if (now >= escalationAt) {
-        next.action = 'recover'; next.reason = 'stale_disconnect_escalation'; next.recoveryMode = 'escalated';
-      }
-    }
-  }
-  // An escalation remains spaced even if the normal rolling window later empties.
-  if (previous.lastEscalationAt != null && now < previous.lastEscalationAt + config.escalationIntervalMs) {
-    next.action = 'observe'; next.reason = 'escalation_cooldown';
-    next.nextEligibleAt = previous.lastEscalationAt + config.escalationIntervalMs;
+  if (!key || paused || (retry?.candidate !== key && now - next.failureSince < confirmationMs)) return next;
+  if (retryAt !== null && now < retryAt) {
+    next.reason = 'retry_backoff';
+    next.nextEligibleAt = retryAt;
+  } else {
+    next.action = 'recover'; next.reason = sample.kind; next.recoveryMode = 'normal';
   }
   return next;
 }
@@ -505,11 +483,11 @@ export class Guard {
     const result = await this.command(this.config.node, [...(this.networkRoute === 'configured_proxy' ? ['--use-env-proxy'] : []),
       '--input-type=module', '--eval', `await (${readRemoteRecord.toString()})(...process.argv.slice(1));`,
       this.config.recoveryCli || this.config.cli, this.config.spaceId], this.config.probeTimeoutMs);
-    if (!result.ok) throw new Error('Remote lifecycle probe failed; escalation unavailable');
+    if (!result.ok) throw new Error('Remote lifecycle probe failed');
     const record = JSON.parse(result.stdout);
     if (record !== null && (typeof record !== 'object' || Array.isArray(record) ||
         Object.values(record).some(v => v !== null && typeof v !== 'string')))
-      throw new Error('Invalid remote lifecycle record; escalation unavailable');
+      throw new Error('Invalid remote lifecycle record');
     return record;
   }
   async sharedServer() {
@@ -562,7 +540,9 @@ export class Guard {
       throw new Error('Invalid guard state; original file retained');
     const pending = state.pendingRecovery;
     const time = value => Number.isFinite(value) && value >= 0;
-    if ((state.lastEscalationAt != null && !time(state.lastEscalationAt)) ||
+    if ((state.retry != null && (!Number.isSafeInteger(state.retry.attempts) || state.retry.attempts < 1 ||
+          !time(state.retry.lastAttemptAt) || typeof state.retry.candidate !== 'string' || !state.retry.candidate)) ||
+        (state.lastEscalationAt != null && !time(state.lastEscalationAt)) ||
         (state.lastNotice != null && (typeof state.lastNotice.key !== 'string' || !time(state.lastNotice.at))) ||
         (pending != null && (!pending || typeof pending.id !== 'string' || !pending.id ||
           !/^[a-f0-9]{64}$/.test(pending.scope) ||
@@ -714,7 +694,7 @@ export class Guard {
     return assessNetwork({ summary: this.networkPolicy, configError: this.networkConfigError, sample,
       proxyChecks, diagnostics, now, intervalMs: this.config.intervalMs, previous });
   }
-  async recover(sample, beforeMutation, pending = null, progress = async () => {}, escalated = false) {
+  async recover(sample, beforeMutation, pending = null, progress = async () => {}) {
     if (pending && pending.scope !== this.recoveryScope()) throw new Error('Pending recovery scope changed; refusing mutation');
     await this.preflight();
     if (await this.paused()) return { outcome: 'skipped', reason: 'paused' };
@@ -723,8 +703,6 @@ export class Guard {
       return { outcome: 'skipped', reason: 'Runtime changed since probe' };
     if (sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
       return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
-    if (escalated && !staleDisconnected(fresh, this.now(), this.config, pending))
-      return { outcome: 'skipped', reason: 'Stale disconnect evidence changed since probe' };
     if (this.config.codexShared && fresh.sharedServer?.state === 'absent') {
       // Start is idempotent. Never stop or restart a daemon shared with other clients.
       await this.refreshNetworkEnvironment();
@@ -795,10 +773,13 @@ export class Guard {
       return { outcome: 'recovered', reason: 'replacement_adopted', pid: beforeStart.pid, runtimeId: beforeStart.runtimeId };
     }
     const sourceId = pending?.sourceRuntimeId ?? sample.runtimeId;
-    if (beforeStart.kind === 'another_runtime' || (sourceId && beforeStart.remoteRuntimeId && beforeStart.remoteRuntimeId !== sourceId))
-      return { outcome: 'pending', reason: beforeStart.kind === 'another_runtime' && beforeStart.remoteRuntimeId === sourceId
-        ? 'waiting_previous_lease' : 'recovery_conflict' };
-    if (beforeStart.kind !== 'process_down') return { outcome: 'skipped', reason: `Startup no longer safe: ${beforeStart.kind}` };
+    const ownLease = (pending?.sourcePid || sample.pid) && beforeStart.kind === 'another_runtime' &&
+      !beforeStart.pid && beforeStart.remoteRuntimeId === sourceId;
+    if ((!ownLease && beforeStart.kind === 'another_runtime') ||
+        (sourceId && beforeStart.remoteRuntimeId && beforeStart.remoteRuntimeId !== sourceId))
+      return { outcome: 'pending', reason: 'recovery_conflict' };
+    if (beforeStart.kind !== 'process_down' && !ownLease)
+      return { outcome: 'skipped', reason: `Startup no longer safe: ${beforeStart.kind}` };
     const startOwner = await this.owner();
     if (startOwner && await this.processIdentity(startOwner.pid))
       throw new Error('Owner process appeared before startup; refusing duplicate startup');
@@ -806,8 +787,6 @@ export class Guard {
     if (stoppedOwner && startOwner && (startOwner.pid !== stoppedOwner.pid || startOwner.nonce !== stoppedOwner.nonce))
       throw new Error('Runtime owner changed after stop; refusing startup');
     if (await this.paused()) return { outcome: 'pending', reason: 'paused' };
-    if (escalated && !staleDisconnected(beforeStart, this.now(), this.config, pending ?? { sourceRuntimeId: sourceId }))
-      return { outcome: 'pending', reason: 'Stale disconnect evidence changed before startup' };
     // The reviewed startup code reuses matching native consent without importing history.
     // Screen sharing must be explicitly enabled in the guard configuration.
     const start = await this.cli(['runtime', 'up', rootOf(this.config), '--space', this.config.spaceId,
@@ -894,10 +873,9 @@ export class Guard {
     await this.save(next);
     await this.log('health', { paused, sample, decision: next.reason, networkRoute: next.networkRoute,
       nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null });
-    if (['cooldown', 'rate_limited', 'escalation_cooldown', 'resume_retry_limited', 'waiting_previous_lease',
-      'recovery_conflict'].includes(next.reason)) {
+    if (['recovery_conflict', 'another_runtime'].includes(next.reason)) {
       const key = `${next.reason}:${sample.runtimeId ?? 'absent'}:${sample.remoteRuntimeId ?? 'absent'}`;
-      if (next.lastNotice?.key !== key || this.now() - next.lastNotice.at >= this.config.escalationIntervalMs) {
+      if (next.lastNotice?.key !== key || this.now() - next.lastNotice.at >= 60_000) {
         const notice = { reason: next.reason, runtimeId: sample.runtimeId, remoteRuntimeId: sample.remoteRuntimeId,
           nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null,
           remoteEvidenceError: sample.remoteEvidenceError ?? null,
@@ -920,7 +898,7 @@ export class Guard {
       await this.log('ready_hooks', next.lastReadyHooks);
     }
     if (next.action === 'recover') {
-      // An unavailable proxy or account must not consume Runtime restart budgets.
+      // An unavailable proxy or account cannot authorize a recovery invocation.
       try { await this.preflight(); }
       catch (error) {
         next.action = 'observe'; next.reason = 'preflight_blocked'; next.candidate = null; next.failureSince = null;
@@ -929,27 +907,26 @@ export class Guard {
         await this.save(next);
         return next;
       }
-      // Evidence and the rate-limit record must be durable before any destructive action.
+      // Evidence and the retry record must be durable before any destructive action.
       await this.snapshot('before_recovery', sample);
       next.lastRecovery = { at: new Date().toISOString(), outcome: 'preparing' };
+      next.retry = { attempts: Math.min(Number.MAX_SAFE_INTEGER,
+        (next.retry?.attempts ?? next.pendingRecovery?.attempts ?? 0) + 1),
+        lastAttemptAt: this.now(), candidate: next.candidate };
       await this.save(next);
       let reserved = false;
       const reserveAttempt = async (phase, source) => {
         if (await this.paused()) throw new Error('Recovery paused before mutation');
         const now = this.now();
-        if (!reserved) {
-          if (!next.pendingRecovery) {
-            next.restarts = [...next.restarts.filter(t => now - t < 3_600_000), now];
-          }
-          if (next.recoveryMode === 'escalated') next.lastEscalationAt = now;
-        }
+        if (!reserved && !next.pendingRecovery)
+          next.restarts = [...next.restarts.filter(t => now - t < 3_600_000), now];
         if (phase && !next.pendingRecovery) next.pendingRecovery = { id: randomUUID(), scope: this.recoveryScope(),
-          budgetAt: next.restarts.at(-1), mode: next.recoveryMode === 'escalated' ? 'escalated' : 'normal',
-          attempts: reserved ? 1 : 0, lastAttemptAt: now, nextAttemptAt: now + this.config.resumeRetryMs,
+          budgetAt: next.restarts.at(-1), mode: 'normal',
+          attempts: reserved ? 1 : 0, lastAttemptAt: now, nextAttemptAt: now + retryDelay(next.retry.attempts, this.config),
           sourcePid: null, sourceRuntimeId: null, sourceNonce: null, sourceIdentity: null, ...source };
         if (!reserved && next.pendingRecovery) next.pendingRecovery = {
-          ...next.pendingRecovery, attempts: next.pendingRecovery.attempts + 1,
-          lastAttemptAt: now, nextAttemptAt: now + this.config.resumeRetryMs,
+          ...next.pendingRecovery, attempts: Math.min(Number.MAX_SAFE_INTEGER, next.pendingRecovery.attempts + 1),
+          lastAttemptAt: now, nextAttemptAt: now + retryDelay(next.retry.attempts, this.config),
         };
         if (phase && next.pendingRecovery) next.pendingRecovery = { ...next.pendingRecovery, phase };
         next.lastRecovery = { ...next.lastRecovery, outcome: 'started',
@@ -964,14 +941,23 @@ export class Guard {
         }
       };
       try {
-        const result = await this.recover(sample, reserveAttempt,
-          next.pendingRecovery, progress, next.recoveryMode === 'escalated');
+        const result = await this.recover(sample, reserveAttempt, next.pendingRecovery, progress);
         next.lastRecovery = { ...next.lastRecovery, ...result };
-        if (next.lastRecovery.outcome === 'recovered') next.pendingRecovery = null;
+        if (next.lastRecovery.outcome === 'recovered') {
+          next.pendingRecovery = null;
+          next.retry = null;
+        }
       }
       catch (e) { next.lastRecovery = { ...next.lastRecovery, outcome: reserved ? 'failed' : 'deferred', error: redact(e.message) }; }
-      next.candidate = null;
-      next.failureSince = null;
+      // Space retries from completion too: a slow failing command must not cause an immediate loop.
+      if (next.retry) {
+        next.retry.lastAttemptAt = this.now();
+        next.nextEligibleAt = next.retry.lastAttemptAt + retryDelay(next.retry.attempts, this.config);
+        if (next.pendingRecovery) {
+          next.pendingRecovery.lastAttemptAt = next.retry.lastAttemptAt;
+          next.pendingRecovery.nextAttemptAt = next.nextEligibleAt;
+        }
+      } else next.nextEligibleAt = null;
       await this.log('recovery_finished', next.lastRecovery);
       await this.save(next);
     }
@@ -1033,9 +1019,13 @@ export async function main(command, file) {
     await guard.loadState();
     await guard.log('guard_started', { pid: process.pid, spaceId: guard.config.spaceId });
     while (!controller.signal.aborted) {
-      try { await guard.tick(await guard.loadState()); }
+      let waitMs = guard.config.intervalMs;
+      try {
+        const state = await guard.tick(await guard.loadState());
+        if (state.nextEligibleAt > guard.now()) waitMs = Math.min(waitMs, state.nextEligibleAt - guard.now());
+      }
       catch (e) { await guard.log('monitor_error', { error: redact(e.message) }); }
-      await sleep(guard.config.intervalMs, undefined, { signal: controller.signal }).catch(e => { if (e.name !== 'AbortError') throw e; });
+      await sleep(Math.max(1, waitMs), undefined, { signal: controller.signal }).catch(e => { if (e.name !== 'AbortError') throw e; });
     }
     await guard.log('guard_stopped');
   } finally { await unlock(); }
