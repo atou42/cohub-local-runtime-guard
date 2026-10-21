@@ -1,0 +1,899 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -19,7 +19,7 @@
+   ],
+   "dependencies": {
+     "@neta-art/cohub": "11.5.0",
+-    "@neta-art/generation": "^0.1.39",
++    "@neta-art/generation": "0.1.39",
+     "commander": "^15.0.0",
+     "sharp": "^0.35.4",
+     "ws": "^8.21.3"
+diff --git a/dist/runtime/connection.js b/dist/runtime/connection.js
+--- a/dist/runtime/connection.js
++++ b/dist/runtime/connection.js
+@@ -1,13 +1,13 @@
+ import { randomUUID } from "node:crypto";
+ import { setTimeout as delay } from "node:timers/promises";
+ import { RUNTIME_MAX_FRAME_BYTES, RUNTIME_PROTOCOL_VERSION, runtimeCommandSchema, runtimeReadySchema, runtimeNativeStopSchema, } from "@neta-art/cohub";
+-import { describeError } from "../network-error.js";
+-import { executeTurn } from "./native/execution.js";
+-import { ContextRequiredError } from "./native/results.js";
+-import { ProcessCleanupUncertainError } from "./process-group.js";
++import { RuntimeExecutions } from "./reconnect-executions.js";
+ import { serializeDiagnosticError, } from "./diagnostics.js";
+ export async function serveRuntime(options) {
+     const runtimeId = options.runtimeId ?? options.diagnostics?.runtimeId ?? randomUUID();
++    const executions = new RuntimeExecutions(options);
++    const abortExecutions = () => executions.abort();
++    options.signal.addEventListener("abort", abortExecutions, { once: true });
+     let backoff = 500;
+     let attempt = 0;
+     let conflictSince = null;
+@@ -17,7 +17,6 @@
+     const flush = () => options.executor.archives.flush(uploadSignal).catch((error) => {
+         if (!uploadSignal.aborted) {
+             log("warn", "archive.flush_failed", { error: serializeDiagnosticError(error) });
+-            // The diagnostic sink handles terminal presentation and throttling.
+         }
+     });
+     const timer = setInterval(() => {
+@@ -45,7 +44,7 @@
+                         options.onReady();
+                         void flush();
+                     },
+-                });
++                }, executions);
+             }
+             catch (error) {
+                 if (options.signal.aborted)
+@@ -80,21 +79,13 @@
+     finally {
+         clearInterval(timer);
+         uploads.abort();
++        await executions.close();
++        options.signal.removeEventListener("abort", abortExecutions);
+         await flush();
+         log("info", "runtime.stopped", { runtimeId });
+     }
+ }
+-function executionContext(connectionId, input) {
+-    return {
+-        connectionId,
+-        sessionId: input.sessionId,
+-        turnId: input.turnId,
+-        harness: input.harness,
+-        requestId: input.traceContext?.requestId ?? input.requestId ?? null,
+-        traceContext: input.traceContext,
+-    };
+-}
+-async function connect(options) {
++async function connect(options, executions) {
+     const log = (level, event, data, context) => options.diagnostics?.log(level, event, data, context);
+     const connectedAt = Date.now();
+     log("debug", "runtime.websocket.connecting", {
+@@ -109,13 +100,11 @@
+         log("warn", error instanceof Error && error.name === "AuthRequiredError" ? "runtime.auth_required" : "runtime.auth_token_failed", { error: serializeDiagnosticError(error) });
+         throw error;
+     }
++    options.signal.throwIfAborted();
+     const runtimeUrl = new URL(options.url);
+     runtimeUrl.searchParams.set("runtimeId", options.runtimeId);
+     const socket = new WebSocket(runtimeUrl.toString());
+-    const active = new Map();
+-    const seen = new Set();
+     const disconnected = new AbortController();
+-    const contexts = new Map();
+     let lastHeartbeat = Date.now();
+     let connectionId = null;
+     let fatal = false;
+@@ -143,9 +132,10 @@
+         socket.send(data);
+     };
+     const closeTransport = () => socket.close();
++    const channel = { get connectionId() { return connectionId; }, send, close: closeTransport,
++        isOpen: () => nativeChannelReady && !disconnected.signal.aborted && socket.readyState === WebSocket.OPEN };
+     const shutdown = () => {
+-        for (const execution of active.values())
+-            execution.controller.abort();
++        executions.abort();
+         closeTransport();
+     };
+     const sendNative = (event) => new Promise((resolve, reject) => {
+@@ -172,7 +162,7 @@
+         if (heartbeatAgeMs > 30_000) {
+             log("error", "runtime.heartbeat_timeout", {
+                 ageMs: heartbeatAgeMs,
+-                activeExecutions: active.size,
++                activeExecutions: executions.active.size,
+             }, { connectionId });
+             closeTransport();
+         }
+@@ -181,12 +171,12 @@
+                 send({ type: "runtime.heartbeat" });
+             }
+             catch (error) {
+-                log("warn", "runtime.heartbeat_send_failed", {
+-                    error: serializeDiagnosticError(error),
+-                }, { connectionId });
++                log("warn", "runtime.heartbeat_send_failed", { error: serializeDiagnosticError(error) }, { connectionId });
+                 closeTransport();
+             }
+             void options.token().then((next) => {
++                if (disconnected.signal.aborted)
++                    return;
+                 if (next !== currentToken) {
+                     try {
+                         send({ type: "runtime.auth", token: next });
+@@ -194,13 +184,13 @@
+                         log("debug", "runtime.auth_refreshed", undefined, { connectionId });
+                     }
+                     catch (error) {
+-                        log("warn", "runtime.auth_refresh_send_failed", {
+-                            error: serializeDiagnosticError(error),
+-                        }, { connectionId });
++                        log("warn", "runtime.auth_refresh_send_failed", { error: serializeDiagnosticError(error) }, { connectionId });
+                         closeTransport();
+                     }
+                 }
+             }).catch((error) => {
++                if (disconnected.signal.aborted)
++                    return;
+                 log("warn", "runtime.auth_refresh_failed", { error: serializeDiagnosticError(error) }, { connectionId });
+                 closeTransport();
+             });
+@@ -216,11 +206,14 @@
+             }
+             conflict = event.code === 4409;
+             disconnected.abort();
++            clearTimeout(readyTimer);
++            clearInterval(heartbeat);
++            executions.detach(channel);
+             log(options.signal.aborted ? "debug" : fatal || conflict ? "error" : "warn", fatal ? "runtime.websocket.rejected" : "runtime.websocket.closed", {
+                 code: event.code,
+                 reason: event.reason,
+                 durationMs: Date.now() - connectedAt,
+-                activeExecutions: active.size,
++                activeExecutions: executions.active.size,
+                 fatal,
+                 conflict,
+             }, { connectionId });
+@@ -232,11 +225,11 @@
+             nativePending.clear();
+             options.onDisconnected?.();
+             const executionMustStop = options.signal.aborted || fatal || conflict;
+-            for (const execution of active.values()) {
++            for (const execution of executions.active.values()) {
+                 log(executionMustStop ? "error" : "warn", executionMustStop ? "runtime.execution_transport_invalidated" : "runtime.execution_transport_detached", {
+                     code: event.code,
+                     reason: event.reason,
+-                }, executionContext(connectionId, execution));
++                }, executions.context(execution, channel));
+                 if (executionMustStop)
+                     execution.controller.abort();
+             }
+@@ -244,26 +237,15 @@
+         }, { once: true });
+     });
+     socket.addEventListener("error", (event) => {
+-        const detail = event.error;
+-        log("warn", "runtime.websocket.error", {
+-            type: event.type,
+-            error: serializeDiagnosticError(detail ?? new Error("WebSocket error")),
+-        }, { connectionId });
+-        socket.close();
++        log("warn", "runtime.websocket.error", { type: event.type,
++            error: serializeDiagnosticError(event.error ?? new Error("WebSocket error")) }, { connectionId });
++        closeTransport();
+     });
+     socket.addEventListener("open", () => {
+         try {
+-            log("info", "runtime.websocket.open", {
+-                attempt: options.attempt,
+-                durationMs: Date.now() - connectedAt,
+-            });
+-            send({
+-                type: "runtime.hello",
+-                version: RUNTIME_PROTOCOL_VERSION,
+-                spaceId: options.spaceId,
+-                token: currentToken,
+-                capabilities: options.capabilities,
+-            });
++            log("info", "runtime.websocket.open", { attempt: options.attempt, durationMs: Date.now() - connectedAt });
++            send({ type: "runtime.hello", version: RUNTIME_PROTOCOL_VERSION, spaceId: options.spaceId,
++                token: currentToken, capabilities: options.capabilities });
+         }
+         catch (error) {
+             log("error", "runtime.hello_failed", { error: serializeDiagnosticError(error) });
+@@ -272,6 +254,8 @@
+     });
+     socket.addEventListener("message", (event) => {
+         void (async () => {
++            if (disconnected.signal.aborted)
++                return;
+             let raw;
+             try {
+                 raw = JSON.parse(String(event.data));
+@@ -290,29 +274,18 @@
+                     throw new Error("Runtime connection identity changed");
+                 connectionId = frame.connectionId;
+                 clearTimeout(readyTimer);
+-                log("info", "runtime.ready", {
+-                    connectionId,
+-                    durationMs: Date.now() - connectedAt,
+-                }, { connectionId });
++                log("info", "runtime.ready", { connectionId, durationMs: Date.now() - connectedAt }, { connectionId });
+                 nativeChannelReady = true;
++                executions.attach(channel);
+                 options.onNativeChannel?.(sendNative);
+                 options.onReady();
+-                let recoveryBatch = 0;
+-                for await (const executions of options.executor.results.pendingBatches()) {
+-                    recoveryBatch += 1;
+-                    log("info", "runtime.recovery_batch_sent", {
+-                        batch: recoveryBatch,
+-                        count: executions.length,
+-                    }, { connectionId });
+-                    send({ type: "runtime.recovery", executions });
+-                }
++                await executions.announce(channel);
+                 return;
+             }
+             if (!connectionId)
+                 throw new Error("Runtime handshake is incomplete");
+-            if (raw.type === "runtime.heartbeat") {
+-                return;
+-            }
++            if (raw.type === "runtime.heartbeat")
++                return;
+             if (raw.type === "runtime.native.stop") {
+                 const stop = runtimeNativeStopSchema.safeParse(raw);
+                 if (!stop.success) {
+@@ -324,270 +297,18 @@
+                 return;
+             }
+             if (raw.type === "runtime.native.result") {
+-                const result = raw;
+-                const pending = result.requestId ? nativePending.get(result.requestId) : null;
++                const pending = raw.requestId ? nativePending.get(raw.requestId) : null;
+                 if (!pending)
+                     return;
+                 clearTimeout(pending.timer);
+-                nativePending.delete(result.requestId ?? "");
+-                if (result.error)
+-                    pending.reject(new Error(result.error));
++                nativePending.delete(raw.requestId);
++                if (raw.error)
++                    pending.reject(new Error(raw.error));
+                 else
+-                    pending.resolve(result.result);
+-                return;
+-            }
+-            const frame = runtimeCommandSchema.parse(raw);
+-            if (frame.type === "session.context") {
+-                log("debug", "runtime.context_received", {
+-                    messageCount: frame.context.messages.length,
+-                }, { connectionId });
+-                contexts.get(frame.requestId)?.(frame.context);
+-                contexts.delete(frame.requestId);
+-                return;
+-            }
+-            if (frame.type === "turn.abort") {
+-                log("info", "runtime.turn_abort_received", undefined, { connectionId, requestId: frame.requestId });
+-                active.get(frame.requestId)?.controller.abort();
+-                return;
+-            }
+-            if (frame.type === "turn.ack") {
+-                const execution = active.get(frame.requestId);
+-                if (!execution)
+-                    return;
+-                const context = executionContext(connectionId, execution);
+-                try {
+-                    await execution.promise;
+-                    if (!execution.result)
+-                        throw new Error("Runtime result is not available");
+-                    await options.executor.results.acknowledge(execution.sessionId, frame.turnId);
+-                }
+-                catch (error) {
+-                    log("error", "runtime.turn_ack_failed", {
+-                        revision: frame.revision,
+-                        error: serializeDiagnosticError(error),
+-                    }, context);
+-                    // Keep the receipt; the next reconciliation can retry acknowledgement.
+-                    active.delete(frame.requestId);
+-                    send({ type: "runtime.event", requestId: frame.requestId, event: { type: "turn.error", message: "Local acknowledgement failed; result retained" } });
+-                    return;
+-                }
+-                log("info", "runtime.turn_acknowledged", { revision: frame.revision }, context);
+-                active.delete(frame.requestId);
+-                send({ type: "runtime.event", requestId: frame.requestId, event: { type: "turn.acknowledged" } });
+-                return;
+-            }
+-            if (frame.type === "turn.recover") {
+-                const identity = frame.execution;
+-                if (identity.spaceId !== options.spaceId)
+-                    throw new Error("Invalid Runtime target");
+-                const context = executionContext(connectionId, {
+-                    ...identity,
+-                    requestId: frame.traceContext?.requestId,
+-                    traceContext: frame.traceContext,
+-                });
+-                log("info", "runtime.recovery_requested", undefined, context);
+-                const previous = active.get(frame.requestId);
+-                if (previous) {
+-                    if (previous.sessionId !== identity.sessionId || previous.turnId !== identity.turnId || previous.harness !== identity.harness)
+-                        throw new Error("Runtime recovery identity changed");
+-                    await previous.promise;
+-                    const saved = await options.executor.results.recover(identity);
+-                    if (saved)
+-                        for (const event of saved.events)
+-                            send({ type: "runtime.event", requestId: frame.requestId, event });
+-                    return;
+-                }
+-                const running = [...active].find(([, entry]) => entry.turnId === identity.turnId && entry.sessionId === identity.sessionId && entry.harness === identity.harness);
+-                const recovery = {
+-                    ...identity,
+-                    requestId: frame.traceContext?.requestId,
+-                    traceContext: frame.traceContext,
+-                    controller: new AbortController(),
+-                    promise: Promise.resolve(),
+-                };
+-                active.set(frame.requestId, recovery);
+-                recovery.promise = (async () => {
+-                    try {
+-                        if (running) {
+-                            running[1].controller.abort();
+-                            await running[1].promise;
+-                            active.delete(running[0]);
+-                        }
+-                        const saved = await options.executor.results.recover(identity);
+-                        recovery.controller.signal.throwIfAborted();
+-                        const last = saved?.events.at(-1);
+-                        if (!saved || last?.type !== "turn.end")
+-                            throw new Error("No confirmed result");
+-                        recovery.result = { session: saved.session, event: last };
+-                        for (const event of saved.events)
+-                            send({ type: "runtime.event", requestId: frame.requestId, event });
+-                    }
+-                    catch (error) {
+-                        if (!recovery.controller.signal.aborted) {
+-                            log("error", "runtime.recovery_failed", { error: serializeDiagnosticError(error) }, context);
+-                            // Original files and receipts remain available for reconciliation.
+-                            try {
+-                                send({ type: "runtime.event", requestId: frame.requestId, event: { type: "turn.error", uncertain: true, message: "Result unavailable; files retained" } });
+-                            }
+-                            catch {
+-                                // The next connection can read the same result.
+-                            }
+-                        }
+-                        active.delete(frame.requestId);
+-                    }
+-                })();
+-                return;
+-            }
+-            if (frame.input.spaceId !== options.spaceId || !options.capabilities.harnesses.includes(frame.input.harness))
+-                throw new Error("Invalid Runtime target");
+-            const context = executionContext(connectionId, frame.input);
+-            log("info", "runtime.turn_received", {
+-                requestId: frame.requestId,
+-                resumeOnly: frame.resumeOnly === true,
+-            }, context);
+-            const previous = active.get(frame.requestId);
+-            if (previous) {
+-                if (previous.sessionId !== frame.input.sessionId || previous.turnId !== frame.input.turnId || previous.harness !== frame.input.harness)
+-                    throw new Error("Runtime execution identity changed");
+-                await previous.promise;
+-                const saved = await options.executor.results.recover(frame.input, frame.requestId);
+-                if (saved)
+-                    for (const event of saved.events)
+-                        send({ type: "runtime.event", requestId: frame.requestId, event });
+-                return;
+-            }
+-            const requestContext = async (executionSignal) => {
+-                const signal = AbortSignal.any([executionSignal, disconnected.signal]);
+-                signal.throwIfAborted();
+-                const pendingTurnIds = await options.executor.results.pendingTurnIds(frame.input.sessionId);
+-                log("debug", "runtime.context_requested", { pendingTurnCount: pendingTurnIds.length }, context);
+-                return new Promise((resolve, reject) => {
+-                    const abort = () => {
+-                        clearTimeout(timeout);
+-                        contexts.delete(frame.requestId);
+-                        signal.removeEventListener("abort", abort);
+-                        reject(new Error("Runtime context request aborted"));
+-                    };
+-                    const timeout = setTimeout(abort, 60_000);
+-                    signal.addEventListener("abort", abort, { once: true });
+-                    contexts.set(frame.requestId, (nextContext) => {
+-                        clearTimeout(timeout);
+-                        signal.removeEventListener("abort", abort);
+-                        resolve(nextContext);
+-                    });
+-                    try {
+-                        send({ type: "runtime.event", requestId: frame.requestId, event: { type: "context.required", pendingTurnIds } });
+-                    }
+-                    catch {
+-                        abort();
+-                    }
+-                    if (signal.aborted)
+-                        abort();
+-                });
+-            };
+-            if ([...active.values()].some((entry) => entry.sessionId === frame.input.sessionId) && !frame.input.context.complete)
+-                frame.input.context = await requestContext(options.signal);
+-            const repeated = seen.has(frame.requestId);
+-            for (const [requestId, entry] of active) {
+-                if (entry.sessionId !== frame.input.sessionId)
+-                    continue;
+-                const resolved = frame.input.context.resolvedTurnIds?.includes(entry.turnId);
+-                const settled = entry.result && frame.input.context.settledTurnIds?.includes(entry.turnId);
+-                if (!resolved && !settled)
+-                    continue;
+-                entry.controller.abort();
+-                await entry.promise;
+-                active.delete(requestId);
+-            }
+-            if ([...active.values()].some((entry) => entry.sessionId === frame.input.sessionId) || active.size >= 8) {
+-                log("warn", "runtime.turn_rejected_busy", { activeExecutions: active.size }, context);
+-                send({ type: "runtime.event", requestId: frame.requestId, event: { type: "turn.error", message: "Local Runtime is busy" } });
+-                return;
+-            }
+-            seen.add(frame.requestId);
+-            if (seen.size > 4096) {
+-                const oldest = seen.values().next().value;
+-                if (oldest)
+-                    seen.delete(oldest);
+-            }
+-            const controller = new AbortController();
+-            const execution = {
+-                controller,
+-                sessionId: frame.input.sessionId,
+-                turnId: frame.input.turnId,
+-                harness: frame.input.harness,
+-                requestId: frame.input.requestId,
+-                traceContext: frame.input.traceContext,
+-                promise: Promise.resolve(),
+-            };
+-            active.set(frame.requestId, execution);
+-            const durableEvents = [];
+-            const emit = (value) => {
+-                if (value.type === "message.commit")
+-                    durableEvents.push(value);
+-                // Streaming is best-effort. A detached transport must not cancel local model or tool work;
+-                // durable commits and the final result are replayed after reconnect.
+-                if (disconnected.signal.aborted || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > RUNTIME_MAX_FRAME_BYTES)
+-                    return;
+-                try {
+-                    send({ type: "runtime.event", requestId: frame.requestId, event: value });
+-                }
+-                catch (error) {
+-                    if (!disconnected.signal.aborted && socket.readyState === WebSocket.OPEN)
+-                        throw error;
+-                }
+-            };
+-            execution.promise = (async () => {
+-                try {
+-                    const saved = await options.executor.results.recover(frame.input, frame.requestId);
+-                    if (saved) {
+-                        const last = saved.events.at(-1);
+-                        if (last?.type !== "turn.end")
+-                            throw new Error("Incomplete saved Runtime result");
+-                        execution.result = { session: saved.session, event: last };
+-                        for (const event of saved.events)
+-                            emit(event);
+-                        return;
+-                    }
+-                    if (frame.resumeOnly || repeated) {
+-                        emit({ type: "turn.error", message: "Execution outcome is unknown; native files retained, no replay", uncertain: true });
+-                        active.delete(frame.requestId);
+-                        return;
+-                    }
+-                    const run = () => executeTurn(options.executor, frame.input, emit, controller.signal, frame.requestId, context);
+-                    // Preparation can request context, then fall back once from native archive to DB.
+-                    // These retries precede started(), so they never replay model or tool work.
+-                    for (let retry = 0;; retry += 1) {
+-                        try {
+-                            execution.result = await run();
+-                            break;
+-                        }
+-                        catch (error) {
+-                            if (!(error instanceof ContextRequiredError) || retry >= 2)
+-                                throw error;
+-                            frame.input.context = await requestContext(controller.signal);
+-                        }
+-                    }
+-                    await options.executor.results.record(execution.result.session, frame.input, frame.requestId, [...durableEvents, execution.result.event], execution.result.uncertainCleanup);
+-                    if (execution.result.uncertainCleanup) {
+-                        log("warn", "runtime.turn_cleanup_pending", { cleanup: execution.result.uncertainCleanup.error }, context);
+-                    }
+-                    emit(execution.result.event);
+-                }
+-                catch (error) {
+-                    log("error", "runtime.turn_failed", {
+-                        uncertain: Boolean(execution.result) || frame.resumeOnly === true || error instanceof ProcessCleanupUncertainError,
+-                        error: serializeDiagnosticError(error),
+-                    }, context);
+-                    try {
+-                        emit({ type: "turn.error", message: describeError(error), uncertain: !!execution.result || frame.resumeOnly === true || error instanceof ProcessCleanupUncertainError });
+-                    }
+-                    catch {
+-                        // Native files remain for recovery.
+-                    }
+-                    active.delete(frame.requestId);
+-                }
+-            })();
++                    pending.resolve(raw.result);
++                return;
++            }
++            await executions.handle(runtimeCommandSchema.parse(raw), channel);
+         })().catch((error) => {
+             log("error", "runtime.protocol_error", { error: serializeDiagnosticError(error) }, { connectionId });
+             closeTransport();
+@@ -601,7 +322,8 @@
+         shutdown();
+     try {
+         await closed;
+-        await Promise.allSettled([...active.values()].map((entry) => entry.promise));
++        if (options.signal.aborted || fatal || conflict)
++            await executions.settle();
+     }
+     finally {
+         clearTimeout(readyTimer);
+diff --git a/dist/runtime/reconnect-executions.js b/dist/runtime/reconnect-executions.js
+new file mode 100644
+--- /dev/null
++++ b/dist/runtime/reconnect-executions.js
+@@ -0,0 +1,353 @@
++import { RUNTIME_RECOVERY_BATCH_SIZE } from "@neta-art/cohub";
++import { executeTurn } from "./native/execution.js";
++import { ContextRequiredError } from "./native/results.js";
++import { ProcessCleanupUncertainError } from "./process-group.js";
++import { describeError } from "../network-error.js";
++import { serializeDiagnosticError } from "./diagnostics.js";
++
++const identity = (value) => JSON.stringify([value.sessionId, value.turnId, value.harness]);
++const pendingIdentity = ({ sessionId, turnId, harness }) => ({ sessionId, turnId, harness });
++const remember = (map, key, value) => {
++    map.set(key, value);
++    if (map.size > 4096)
++        map.delete(map.keys().next().value);
++};
++
++// Execution and receipt ownership outlive any one control socket. A binding is
++// only a delivery subscription; recovery observers never own cancellation.
++export class RuntimeExecutions {
++    active = new Map();
++    seen = new Map();
++    settled = new Map();
++    tasks = new Set();
++    channel = null;
++    closing = false;
++    constructor(options) {
++        this.options = options;
++    }
++    context(entry, channel = this.channel) {
++        return { connectionId: channel?.connectionId ?? null, sessionId: entry.input.sessionId,
++            turnId: entry.input.turnId, harness: entry.input.harness,
++            requestId: entry.input.traceContext?.requestId ?? entry.input.requestId ?? null,
++            traceContext: entry.input.traceContext };
++    }
++    log(level, event, data, entry, channel) {
++        this.options.diagnostics?.log(level, event, data, entry ? this.context(entry, channel) : { connectionId: channel?.connectionId ?? null });
++    }
++    track(task) {
++        this.tasks.add(task);
++        void task.then(() => this.tasks.delete(task), () => this.tasks.delete(task));
++        return task;
++    }
++    abort() {
++        for (const entry of this.active.values())
++            entry.controller.abort();
++    }
++    async settle() {
++        await Promise.allSettled([...this.tasks]);
++    }
++    async close() {
++        this.closing = true;
++        this.abort();
++        await this.settle();
++    }
++    attach(channel) {
++        this.channel = channel;
++        channel.requests = new Map();
++    }
++    detach(channel) {
++        if (this.channel === channel)
++            this.channel = null;
++        for (const entry of this.active.values()) {
++            for (const [requestId, binding] of entry.bindings) {
++                if (binding.channel === channel)
++                    entry.bindings.delete(requestId);
++            }
++        }
++    }
++    remove(entry) {
++        const key = identity(entry.input);
++        if (this.active.get(key) === entry)
++            this.active.delete(key);
++        for (const binding of entry.bindings.values()) {
++            if (binding.channel.requests.get(binding.requestId) === entry)
++                binding.channel.requests.delete(binding.requestId);
++        }
++        entry.bindings.clear();
++    }
++    available(channel) {
++        return this.channel === channel && channel.isOpen() && !this.closing;
++    }
++    send(channel, frame) {
++        if (!this.available(channel))
++            return false;
++        try {
++            channel.send(frame);
++            return true;
++        }
++        catch (error) {
++            this.log("warn", "runtime.execution_send_deferred", { error: serializeDiagnosticError(error) }, null, channel);
++            channel.close();
++            return false;
++        }
++    }
++    deliver(entry, binding) {
++        while (binding.next < entry.events.length) {
++            const event = entry.events[binding.next];
++            if (!this.send(binding.channel, { type: "runtime.event", requestId: binding.requestId, event }))
++                return false;
++            binding.next++;
++            if (event.type === "turn.end")
++                binding.ended = true;
++        }
++        return true;
++    }
++    emit(entry, event) {
++        const durable = event.type === "message.commit" || event.type === "turn.end";
++        if (durable)
++            entry.events.push(event);
++        for (const binding of entry.bindings.values()) {
++            if (!this.deliver(entry, binding) || durable || (binding.recoveryOnly && event.type !== "turn.error"))
++                continue;
++            this.send(binding.channel, { type: "runtime.event", requestId: binding.requestId, event });
++        }
++    }
++    requestContextDelivery(entry, binding) {
++        const pending = entry.context;
++        if (!pending || binding.recoveryOnly || pending.notified.has(binding))
++            return;
++        if (this.send(binding.channel, { type: "runtime.event", requestId: binding.requestId,
++            event: { type: "context.required", pendingTurnIds: pending.turnIds } }))
++            pending.notified.add(binding);
++    }
++    bind(entry, frame, channel) {
++        let binding = entry.bindings.get(frame.requestId);
++        // A peer can reconnect while the shared control socket stays open.
++        // Its explicit resume/recovery request needs a fresh delivery cursor.
++        if (!binding || binding.channel !== channel || frame.resumeOnly === true || frame.type === "turn.recover") {
++            binding = { requestId: frame.requestId, channel, next: 0, ended: false, recoveryOnly: frame.type === "turn.recover" };
++            entry.bindings.set(frame.requestId, binding);
++        }
++        channel.requests.set(frame.requestId, entry);
++        remember(this.seen, frame.requestId, { identity: identity(entry.input), acknowledged: false });
++        this.deliver(entry, binding);
++        this.requestContextDelivery(entry, binding);
++    }
++    async announce(channel) {
++        const running = new Map([...this.active.values()].map(entry => [identity(entry.input), pendingIdentity(entry.input)]));
++        let batchIndex = 0;
++        const sendBatch = (executions) => {
++            this.log("info", "runtime.recovery_batch_sent", { batch: ++batchIndex, count: executions.length }, null, channel);
++            return this.send(channel, { type: "runtime.recovery", executions });
++        };
++        // Stream the existing receipt batches. Only the at-most-eight live
++        // admissions without receipts need extra memory across those batches.
++        for await (const batch of this.options.executor.results.pendingBatches()) {
++            if (!this.available(channel))
++                return;
++            for (const item of batch)
++                running.delete(identity(item));
++            if (!sendBatch(batch))
++                return;
++        }
++        const entries = [...running.values()];
++        for (let offset = 0; offset < entries.length; offset += RUNTIME_RECOVERY_BATCH_SIZE)
++            if (!sendBatch(entries.slice(offset, offset + RUNTIME_RECOVERY_BATCH_SIZE)))
++                return;
++    }
++    announceCompleted(entry) {
++        // A recovery observer may have timed out while the model was still busy.
++        // Wake reconciliation again when a durable receipt becomes available.
++        if (this.channel && ![...entry.bindings.values()].some(binding => this.available(binding.channel)))
++            this.send(this.channel, { type: "runtime.recovery", executions: [pendingIdentity(entry.input)] });
++    }
++    async requestContext(entry) {
++        entry.controller.signal.throwIfAborted();
++        const turnIds = await this.options.executor.results.pendingTurnIds(entry.input.sessionId);
++        entry.controller.signal.throwIfAborted();
++        this.log("debug", "runtime.context_requested", { pendingTurnCount: turnIds.length }, entry);
++        return new Promise((resolve, reject) => {
++            const signal = entry.controller.signal;
++            const finish = (error, context) => {
++                clearTimeout(timer);
++                signal.removeEventListener("abort", abort);
++                entry.context = null;
++                if (error) reject(error); else resolve(context);
++            };
++            const abort = () => finish(new Error("Runtime context request aborted"));
++            const timer = setTimeout(abort, 60_000);
++            entry.context = { turnIds, notified: new Set(), resolve: context => finish(null, context) };
++            signal.addEventListener("abort", abort, { once: true });
++            for (const binding of entry.bindings.values())
++                this.requestContextDelivery(entry, binding);
++            if (signal.aborted)
++                abort();
++        });
++    }
++    async acknowledge(entry, frame, channel) {
++        if (entry.retired)
++            return;
++        if (frame.turnId !== entry.input.turnId)
++            throw new Error("Runtime acknowledgement identity mismatch");
++        const binding = entry.bindings.get(frame.requestId);
++        if (!binding || binding.channel !== channel || !binding.ended)
++            throw new Error("Runtime acknowledged an unfinished turn");
++        entry.acknowledging ??= this.track((async () => {
++            await entry.promise;
++            if (!entry.result)
++                throw new Error("Runtime result is not available");
++            await this.options.executor.results.acknowledge(entry.input.sessionId, frame.turnId);
++            this.remove(entry);
++            remember(this.settled, identity(entry.input), { acknowledged: true });
++            for (const [requestId, seen] of this.seen) {
++                if (seen.identity === identity(entry.input))
++                    remember(this.seen, requestId, { ...seen, acknowledged: true });
++            }
++            this.log("info", "runtime.turn_acknowledged", { revision: frame.revision }, entry, channel);
++        })());
++        try {
++            await entry.acknowledging;
++            this.send(channel, { type: "runtime.event", requestId: frame.requestId, event: { type: "turn.acknowledged" } });
++        }
++        catch (error) {
++            entry.acknowledging = null;
++            this.log("error", "runtime.turn_ack_failed", { revision: frame.revision, error: serializeDiagnosticError(error) }, entry, channel);
++            this.send(channel, { type: "runtime.event", requestId: frame.requestId,
++                event: { type: "turn.error", uncertain: true, message: "Local acknowledgement failed; result retained" } });
++        }
++    }
++    async handle(frame, channel) {
++        if (!this.available(channel) || this.options.signal.aborted)
++            return;
++        const known = channel.requests.get(frame.requestId);
++        if (frame.type === "session.context") {
++            const binding = known?.bindings.get(frame.requestId);
++            if (known?.context && binding?.channel === channel && !binding.recoveryOnly) {
++                this.log("debug", "runtime.context_received", { messageCount: frame.context.messages.length }, known, channel);
++                known.context.resolve(frame.context);
++            }
++            return;
++        }
++        if (frame.type === "turn.abort") {
++            const binding = known?.bindings.get(frame.requestId);
++            if (binding?.channel === channel) {
++                this.log("info", "runtime.turn_abort_received", { recoveryOnly: binding.recoveryOnly }, known, channel);
++                if (binding.recoveryOnly)
++                    known.bindings.delete(frame.requestId);
++                else
++                    known.controller.abort();
++            }
++            return;
++        }
++        if (frame.type === "turn.ack") {
++            const previous = this.seen.get(frame.requestId);
++            if (previous?.acknowledged) {
++                if (JSON.parse(previous.identity)[1] !== frame.turnId)
++                    throw new Error("Runtime acknowledgement identity mismatch");
++                this.send(channel, { type: "runtime.event", requestId: frame.requestId, event: { type: "turn.acknowledged" } });
++            }
++            else if (known)
++                await this.acknowledge(known, frame, channel);
++            return;
++        }
++        const recovery = frame.type === "turn.recover";
++        const input = recovery ? frame.execution : frame.input;
++        if (input.spaceId !== this.options.spaceId || !this.options.capabilities.harnesses.includes(input.harness))
++            throw new Error("Invalid Runtime target");
++        const key = identity(input);
++        const previous = this.seen.get(frame.requestId);
++        if (previous && previous.identity !== key || known && identity(known.input) !== key ||
++            [...this.active.values()].some(value => value.requestId === frame.requestId && identity(value.input) !== key))
++            throw new Error("Runtime execution identity changed");
++        let entry = this.active.get(key);
++        if (entry) {
++            if (!entry.retired)
++                this.bind(entry, frame, channel);
++            return;
++        }
++        const settled = this.settled.get(key);
++        if (settled?.acknowledged) {
++            const event = previous?.acknowledged ? { type: "turn.acknowledged" } :
++                { type: "turn.error", uncertain: true, message: "Execution already acknowledged; no replay" };
++            this.send(channel, { type: "runtime.event", requestId: frame.requestId, event });
++            return;
++        }
++        if (this.active.size >= 8) {
++            this.send(channel, { type: "runtime.event", requestId: frame.requestId,
++                event: { type: "turn.error", message: "Local Runtime is busy" } });
++            return;
++        }
++        entry = { input, requestId: frame.requestId, controller: new AbortController(), bindings: new Map(), events: [],
++            promise: Promise.resolve(), result: null, context: null, acknowledging: null };
++        this.active.set(key, entry);
++        this.bind(entry, frame, channel);
++        this.log("info", recovery ? "runtime.recovery_requested" : "runtime.turn_received",
++            recovery ? undefined : { requestId: frame.requestId, resumeOnly: frame.resumeOnly === true }, entry, channel);
++        entry.promise = this.track(Promise.resolve().then(async () => {
++            try {
++                if (!recovery) {
++                    const others = () => [...this.active.values()].filter(value => value !== entry && value.input.sessionId === input.sessionId);
++                    if (others().length && !input.context.complete)
++                        input.context = await this.requestContext(entry);
++                    for (const other of others()) {
++                        const resolved = input.context.resolvedTurnIds?.includes(other.input.turnId);
++                        const settled = other.result && input.context.settledTurnIds?.includes(other.input.turnId);
++                        if (resolved || settled) {
++                            // Fence late ACKs before yielding, then drain an ACK already
++                            // in flight before admission may replace this Session's receipt.
++                            other.retired = true;
++                            other.controller.abort();
++                            await other.promise;
++                            await other.acknowledging?.catch(() => undefined);
++                            this.remove(other);
++                            if (!this.settled.has(identity(other.input)))
++                                remember(this.settled, identity(other.input), { acknowledged: false });
++                        }
++                    }
++                    if (others().length)
++                        throw new Error("Local Runtime is busy");
++                }
++                entry.controller.signal.throwIfAborted();
++                const saved = await this.options.executor.results.recover(input, recovery ? undefined : frame.requestId);
++                if (saved) {
++                    const last = saved.events.at(-1);
++                    if (last?.type !== "turn.end")
++                        throw new Error("Incomplete saved Runtime result");
++                    entry.result = { session: saved.session, event: last };
++                    for (const event of saved.events)
++                        this.emit(entry, event);
++                    return;
++                }
++                if (recovery || frame.resumeOnly || previous || settled)
++                    throw new Error("Execution outcome is unknown; native files retained, no replay");
++                for (let retry = 0;; retry++) {
++                    try {
++                        entry.result = await executeTurn(this.options.executor, input, event => this.emit(entry, event),
++                            entry.controller.signal, entry.requestId, this.context(entry));
++                        break;
++                    }
++                    catch (error) {
++                        if (!(error instanceof ContextRequiredError) || retry >= 2)
++                            throw error;
++                        input.context = await this.requestContext(entry);
++                    }
++                }
++                await this.options.executor.results.record(entry.result.session, input, entry.requestId,
++                    [...entry.events, entry.result.event], entry.result.uncertainCleanup);
++                if (entry.result.uncertainCleanup)
++                    this.log("warn", "runtime.turn_cleanup_pending", { cleanup: entry.result.uncertainCleanup.error }, entry);
++                this.emit(entry, entry.result.event);
++                this.announceCompleted(entry);
++            }
++            catch (error) {
++                const uncertain = recovery || !!entry.result || frame.resumeOnly === true || !!previous || !!settled || error instanceof ProcessCleanupUncertainError;
++                this.log("error", recovery ? "runtime.recovery_failed" : "runtime.turn_failed",
++                    { uncertain, error: serializeDiagnosticError(error) }, entry);
++                this.emit(entry, { type: "turn.error", uncertain, message: describeError(error) });
++                this.remove(entry);
++                if (!recovery)
++                    remember(this.settled, key, { acknowledged: false });
++            }
++        }));
++    }
++}

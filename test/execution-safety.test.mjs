@@ -10,7 +10,7 @@ test('without confirmed transport loss, active executions remain protected, incl
   for (const pendingRecovery of [null, { sourcePid: 300, sourceRuntimeId: 'runtime-a', attempts: 1, lastAttemptAt: 0 }]) {
     let state = { ...base(), pendingRecovery };
     for (let now = 0; now <= 20 * 60_000; now += CONFIG.intervalMs) {
-      state = decide(state, sample, now, false, CONFIG);
+      state = decide(state, { ...sample, harnessConnected: undefined }, now, false, CONFIG);
       assert.equal(state.action, 'observe', `must preserve execution at ${now}`);
     }
     assert.equal(state.reason, 'execution_active');
@@ -36,6 +36,48 @@ test('continuous reconnecting reaches the configured deadline even with active o
     assert.equal(state.action, 'recover');
     assert.equal(state.reason, 'disconnect_timeout');
   }
+});
+
+test('control disconnection uses four minutes even when aggregate status is ready and idle is confirmed', () => {
+  const config = { ...CONFIG, disconnectedMs: 240_000, unhealthyMs: 120_000 };
+  const observation = { ...sample, localState: 'ready', transportFailure: null, executionActivity: { state: 'idle' } };
+  let state = advance(base(), observation, 0, 230_000, config);
+  assert.equal(state.action, 'observe'); assert.equal(state.failureSince, 0);
+  state = decide(state, observation, 240_000, false, config);
+  assert.equal(state.action, 'recover'); assert.equal(state.reason, 'disconnect_timeout');
+});
+
+test('a connected control channel vetoes stale heartbeat and pending-journal authorization', () => {
+  const overdue = advance(base(), disconnected, 0, CONFIG.disconnectedMs);
+  for (const kind of ['connection_stuck', 'workspace_unavailable']) {
+    const sample = { ...disconnected, kind, harnessConnected: true, workspaceConnected: false,
+      heartbeatTimeoutAt: CONFIG.disconnectedMs, executionActivity: { state: 'idle' } };
+    const next = decide({ ...overdue, pendingRecovery: { phase: 'stopping', trigger: 'disconnect_timeout',
+      sourcePid: sample.pid, sourceRuntimeId: sample.runtimeId, attempts: 5, lastAttemptAt: 0 } },
+      sample, CONFIG.disconnectedMs + CONFIG.intervalMs, false, CONFIG);
+    assert.equal(next.action, 'observe'); assert.equal(next.failureSince, null);
+  }
+});
+
+test('workspace-only failure resets the control outage clock before a later combined failure', () => {
+  let state = advance(base(), disconnected, 0, CONFIG.disconnectedMs - CONFIG.intervalMs);
+  const workspace = { ...disconnected, kind: 'workspace_unavailable', harnessConnected: true, workspaceConnected: false };
+  state = decide(state, workspace, CONFIG.disconnectedMs, false, CONFIG);
+  assert.equal(state.failureSince, null); assert.equal(state.action, 'observe');
+  const from = CONFIG.disconnectedMs + CONFIG.intervalMs;
+  state = advance(state, disconnected, from, from + CONFIG.disconnectedMs - CONFIG.intervalMs);
+  assert.equal(state.failureSince, from); assert.equal(state.action, 'observe');
+  assert.equal(decide(state, disconnected, from + CONFIG.disconnectedMs, false, CONFIG).action, 'recover');
+});
+
+test('recover refuses workspace-only failure even when called directly with an overdue journal', async () => {
+  const g = new Guard(CONFIG);
+  const workspace = { ...disconnected, kind: 'workspace_unavailable', harnessConnected: true, workspaceConnected: false };
+  g.preflight = async () => {}; g.paused = async () => false; g.probe = async () => workspace;
+  g.owner = async () => { throw new Error('must not inspect a worker for termination'); };
+  const state = advance(base(), disconnected, 0, CONFIG.disconnectedMs);
+  assert.deepEqual(await g.recover(workspace, undefined, null, undefined, state),
+    { outcome: 'skipped', reason: 'workspace_unavailable' });
 });
 
 test('short disconnect with active work stays protected even with an old pending recovery', () => {
@@ -134,7 +176,7 @@ test('unknown execution activity cannot authorize a generic restart', () => {
   for (const executionActivity of [undefined, { state: 'unknown' }]) {
     let state = base();
     for (let now = 0; now <= 300_000; now += CONFIG.intervalMs) {
-      state = decide(state, { ...sample, transportFailure: null, executionActivity }, now, false, CONFIG);
+      state = decide(state, { ...sample, harnessConnected: undefined, transportFailure: null, executionActivity }, now, false, CONFIG);
     }
     assert.equal(state.action, 'observe');
     assert.equal(state.reason, 'execution_activity_unknown');

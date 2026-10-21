@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "10.6.0-reconnect1",
+  "base": {
+    "version": "10.6.0",
+    "fingerprint": "30206d37d3d52e3e32546c9aaa9c1c8d32780c9a8477f909772608948129c0d0",
+    "packageSha256": "b8d3323773f8bcd5989359bf9a6f212550d1b994a6ea62151a38f29916a2022a"
+  },
+  "result": {
+    "version": "10.6.0",
+    "fingerprint": "74bdfe921f1d044aaf6139e0cf66c8774d07ca4262c862e3edeef2dfeca6ee91",
+    "packageSha256": "63a5810d98a7062ffed09719469de436c436ab2e6e72051456774814aa09a169"
+  },
+  "generation": "0.1.39",
+  "patchSha256": "18022664cdee6c0373e3c5c9d2835f4ef4d59440b031a59dab96679136ba540a",
+  "dependencyLockSha256": "6d7e3b593f5f6087c1c68de3f97b1f850f3fc9cb36fb08c7d50c6eb93367ce0d",
+  "changedFiles": [
+    "package.json",
+    "dist/runtime/connection.js",
+    "dist/runtime/reconnect-executions.js"
+  ]
+}

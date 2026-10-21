@@ -10,7 +10,7 @@ import { CONFIG, TARGETS, Guard, configFor, loadConfig, decide, retryDelay, insp
 const base = () => ({ version: 1, restarts: [], checkedAt: null, candidate: null, failureSince: null });
 const failed = { kind: 'connection_stuck', runtimeId: 'runtime-a', pid: 300,
   harnessConnected: false, executionActivity: { state: 'idle' } };
-const policy = { ...CONFIG, intervalMs: 30, unhealthyMs: 120, retryBaseMs: 50, retryMaxMs: 600 };
+const policy = { ...CONFIG, intervalMs: 30, unhealthyMs: 120, disconnectedMs: 120, retryBaseMs: 50, retryMaxMs: 600 };
 const advance = (state, sample, from, until, paused = false, config = policy) => {
   for (let t = from; t <= until; t += config.intervalMs) state = decide(state, sample, t, paused, config);
   return state;
@@ -131,6 +131,22 @@ test('malformed status is not interpreted as offline', () => {
   const conflict = rawStatus(); conflict.remote.runtimeId = 'other';
   assert.equal(summarizeStatus(conflict).kind, 'another_runtime');
 });
+test('workspace-only failures stay distinct from task/control disconnection', () => {
+  for (const state of ['starting', 'ready', 'reconnecting', 'stopping']) {
+    for (const [localOnline, remoteOnline] of [[false, false], [false, true], [true, false]]) {
+      const raw = rawStatus();
+      Object.assign(raw.local, { state, workspaceConnected: localOnline });
+      raw.remote.workspace.online = remoteOnline;
+      const sample = summarizeStatus(raw);
+      assert.equal(sample.kind, 'workspace_unavailable');
+      const decision = advance(base(), sample, 0, 3_600_000, false, CONFIG);
+      assert.equal(decision.action, 'observe'); assert.equal(decision.failureSince, null);
+    }
+  }
+  const raw = rawStatus(); raw.local.workspaceConnected = false; raw.remote.runtimeId = 'other-environment';
+  assert.equal(summarizeStatus(raw).kind, 'another_runtime', 'workspace errors must not hide a competing owner');
+});
+
 test('log projection excludes commands, prompts, credentials and stacks', () => {
   const e = safeRuntimeEvents([{ event: 'error', data: { code: 1006, cmd: 'PRIVATE_COMMAND', prompt: 'PRIVATE_PROMPT' },
     error: { message: 'Bearer PRIVATE_TOKEN https://u:password@host/?token=secret', stack: 'PRIVATE_STACK' } }]);
@@ -223,13 +239,77 @@ test('integration: active execution 1006 retains the actual worker without stop,
   assert.ok(calls.every(a => !a.includes('prompt') && !a.includes('import')));
 });
 
-async function overdue(g) {
-  const clock = Date.now();
-  g.now = () => clock;
+async function overdue(g, previous = base()) {
+  const clock = g.now();
   const sample = await g.probe();
-  const state = advance(base(), sample, clock - g.config.disconnectedMs,
+  const state = advance(previous, sample, clock - g.config.disconnectedMs,
     clock - g.config.intervalMs, false, g.config);
   return { sample, state };
+}
+
+test('integration: workspace-only 409 retains the worker and throttles persistent notices', async t => {
+  const g = await fixture(t); await g.cli(['runtime', 'up']);
+  const pid = (await g.owner()).pid;
+  await setFixture(g, { stuck: true, harnessConnected: true, workspaceConnected: false,
+    activeExecutions: 2, events: [{ timestamp: new Date().toISOString(), event: 'sandboxd.log',
+      data: { status: 409, message: 'relay configuration rejected' } }] });
+  const sample = await g.probe(); assert.equal(sample.kind, 'workspace_unavailable');
+  let clock = Date.now(); g.now = () => clock;
+  const notices = []; g.notify = notice => notices.push(notice);
+  const previous = { ...base(), checkedAt: clock - g.config.intervalMs,
+    candidate: `connection_stuck:${sample.runtimeId}`, failureSince: clock - 600_000,
+    sample: { ...sample, kind: 'connection_stuck', harnessConnected: false } };
+  let state = await g.tick(previous);
+  assert.equal(state.action, 'observe'); assert.equal(state.reason, 'workspace_unavailable');
+  assert.equal(state.failureSince, null); assert.equal(notices.length, 1);
+  assert.equal(notices[0].event, 'workspace_unavailable');
+  clock += g.config.intervalMs; state = await g.tick(state); assert.equal(notices.length, 1);
+  const restarted = reopenGuard(g); restarted.now = () => clock; restarted.notify = g.notify;
+  state = await restarted.tick(await restarted.loadState()); assert.equal(notices.length, 1);
+  clock += 60_000; state = await restarted.tick(state); assert.equal(notices.length, 2);
+  assert.equal(state.lastRecovery, undefined); assert.ok(await g.processIdentity(pid));
+  await assert.rejects(fs.access(path.join(g.config.home, 'signals.jsonl')), { code: 'ENOENT' });
+  assert.equal((await calls(g)).filter(args => args[1] === 'down').length, 0);
+  assert.equal((await calls(g)).filter(args => args[1] === 'up').length, 1);
+  assert.match(await fs.readFile(g.logFile, 'utf8'), /workspace_unavailable/);
+});
+
+for (const workspaceConnected of [true, false]) {
+  test(`integration: disconnected task/control restarts after four minutes with workspace ${workspaceConnected ? 'online' : 'offline'}`, async t => {
+    const g = await fixture(t); await g.cli(['runtime', 'up']);
+    await setFixture(g, { stuck: true, harnessConnected: false, workspaceConnected, activeExecutions: 2 });
+    const { sample, state } = await overdue(g);
+    assert.equal(g.config.disconnectedMs, 240_000);
+    assert.equal(state.action, 'observe', 'active execution survives inside the threshold');
+    assert.equal(sample.workspaceConnected, workspaceConnected);
+    const recovered = await g.tick(state);
+    assert.equal(recovered.reason, 'disconnect_timeout'); assert.equal(recovered.lastRecovery.outcome, 'recovered');
+    assert.equal(await g.processIdentity(sample.pid), null);
+    assert.notEqual((await g.probe()).pid, sample.pid);
+    assert.equal((await calls(g)).filter(args => args[1] === 'up').length, 2);
+  });
+}
+
+for (const boundary of ['before_term', 'before_kill']) {
+  test(`integration: control recovery with workspace still down at ${boundary} revokes the next signal`, async t => {
+    const g = await fixture(t); await setFixture(g, { ignoreTerm: true }); await g.cli(['runtime', 'up']);
+    await setFixture(g, { stuck: true, activeExecutions: 2 });
+    const { sample, state } = await overdue(g);
+    const controlRecovered = () => setFixture(g, { harnessConnected: true, workspaceConnected: false });
+    if (boundary === 'before_term') {
+      const probe = g.probe.bind(g); let probes = 0;
+      g.probe = async () => { if (++probes === 3) await controlRecovered(); return probe(); };
+    } else {
+      const log = g.log.bind(g);
+      g.log = async (event, data) => { await log(event, data); if (event === 'graceful_stop') await controlRecovered(); };
+    }
+    const result = await g.tick(state);
+    assert.ok(['failed', 'deferred'].includes(result.lastRecovery.outcome));
+    assert.ok(await g.processIdentity(sample.pid));
+    assert.ok(!(await fs.readFile(g.logFile, 'utf8')).includes('forced_stop'));
+    assert.equal((await calls(g)).filter(args => args[1] === 'up').length, 1);
+    if (boundary === 'before_term') await assert.rejects(fs.access(path.join(g.config.home, 'signals.jsonl')), { code: 'ENOENT' });
+  });
 }
 
 for (const activeExecutions of [0, 2]) {
@@ -1056,13 +1136,14 @@ test('a proxy change immediately before stop defers recovery without consuming b
   await g.recover(await g.probe());
   const owner = await g.owner();
   await setFixture(g, { stuck: true, localState: 'ready' });
-  const pending = await g.tick(base());
-  const invoke = g.cli.bind(g);
-  g.cli = async (args, timeout, beforeExecute) => {
-    if (args[1] === 'down') g.networkSourceEnv = { HTTPS_PROXY: 'socks5://proxy.invalid:1080' };
-    return invoke(args, timeout, beforeExecute);
+  const { state } = await overdue(g);
+  const probe = g.probe.bind(g);
+  let rechecks = 0;
+  g.probe = async () => {
+    if (++rechecks === 2) g.networkSourceEnv = { HTTPS_PROXY: 'socks5://proxy.invalid:1080' };
+    return probe();
   };
-  const result = await g.tick({ ...pending, failureSince: Date.now() - g.config.unhealthyMs - 1, checkedAt: Date.now() });
+  const result = await g.tick(state);
   assert.equal(result.lastRecovery.outcome, 'deferred');
   assert.deepEqual(result.restarts, []);
   assert.ok(await g.processIdentity(owner.pid));
@@ -1099,15 +1180,14 @@ test('10-20: a stopped worker retries its own stale lease under the same recover
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, localState: 'ready' });
   const old = await g.probe();
-  const invoke = g.cli.bind(g);
-  g.cli = async (args, timeout, beforeExecute) => {
-    const result = await invoke(args, timeout, beforeExecute);
-    if (args[1] === 'down') await setFixture(g, {
+  const log = g.log.bind(g);
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'graceful_stop') await setFixture(g, {
       remote: { online: true, runtimeId: old.runtimeId, workspace: { online: false } },
     });
-    return result;
   };
-  let state = await g.tick(base());
+  let state = await g.tick((await overdue(g)).state);
   assert.equal(state.pendingRecovery.phase, 'starting');
   assert.equal(state.restarts.length, 1);
   assert.equal(state.lastRecovery.outcome, 'failed');
@@ -1126,7 +1206,9 @@ test('10-20: a stopped worker retries its own stale lease under the same recover
   assert.equal(state.lastRecovery.outcome, 'recovered');
   assert.equal(state.restarts.length, 1);
   assert.equal(state.pendingRecovery, null);
-  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+  const events = (await fs.readFile(g.logFile, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.filter(e => e.event === 'graceful_stop').length, 1);
   assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 4);
 });
 
@@ -1134,10 +1216,10 @@ test('10-20: old exhausted budgets do not prevent a confirmed idle runtime recov
   const now = Date.parse('2026-10-20T09:35:37Z');
   const restarts = ['08:56:25.321', '09:10:03.193', '09:20:18.574'].map(s => Date.parse(`2026-10-20T${s}Z`));
   const sample = staleOffline(now);
-  const first = advance({ ...base(), restarts }, sample, now - CONFIG.unhealthyMs, now - CONFIG.intervalMs, false, CONFIG);
+  const first = advance({ ...base(), restarts }, sample, now - CONFIG.disconnectedMs, now - CONFIG.intervalMs, false, CONFIG);
   const state = decide(first, sample, now, false, CONFIG);
   assert.equal(state.action, 'recover');
-  assert.equal(state.reason, 'connection_stuck');
+  assert.equal(state.reason, 'disconnect_timeout');
   const again = decide({ ...state, lastEscalationAt: now }, sample, now + 10_000, false, CONFIG);
   assert.equal(again.action, 'recover');
   for (const patch of [
@@ -1179,13 +1261,12 @@ test('pending stop survives a guard interruption and completion is charged once'
   g.now = () => clock;
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, localState: 'ready' });
-  const invoke = g.cli.bind(g);
-  g.cli = async (args, timeout, beforeExecute) => {
-    const result = await invoke(args, timeout, beforeExecute);
-    if (args[1] === 'down') throw new Error('Simulated guard interruption after stop');
-    return result;
+  const log = g.log.bind(g);
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'graceful_stop') throw new Error('Simulated guard interruption after stop');
   };
-  let state = await g.tick(base());
+  let state = await g.tick((await overdue(g)).state);
   assert.equal(state.pendingRecovery.phase, 'stopping');
   const id = state.pendingRecovery.id;
   assert.equal(await g.processIdentity(state.pendingRecovery.sourcePid), null);
@@ -1196,7 +1277,9 @@ test('pending stop survives a guard interruption and completion is charged once'
   assert.equal(state.lastRecovery.operationId, id);
   assert.equal(state.pendingRecovery, null);
   assert.equal(state.restarts.length, 1);
-  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 1);
+  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 0);
+  const events = (await fs.readFile(g.logFile, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.filter(e => e.event === 'graceful_stop').length, 1);
   assert.equal((await calls(g)).filter(a => a[1] === 'up').length, 2);
 });
 
@@ -1206,15 +1289,14 @@ test('a real competing remote instance is never replaced, even during a pending 
   g.notify = () => {};
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, localState: 'ready' });
-  const invoke = g.cli.bind(g);
-  g.cli = async (args, timeout, beforeExecute) => {
-    const result = await invoke(args, timeout, beforeExecute);
-    if (args[1] === 'down') await setFixture(g, { remote: {
+  const log = g.log.bind(g);
+  g.log = async (event, data) => {
+    await log(event, data);
+    if (event === 'graceful_stop') await setFixture(g, { remote: {
       online: true, runtimeId: 'genuine-competitor', workspace: { online: true },
     } });
-    return result;
   };
-  let state = await g.tick(base());
+  let state = await g.tick((await overdue(g)).state);
   assert.equal(state.lastRecovery.reason, 'recovery_conflict');
   state = await g.tick(await g.loadState());
   assert.equal(state.reason, 'recovery_conflict');
@@ -1229,15 +1311,13 @@ test('pending recovery retains scope and process identity checks across restarts
   g.config = { ...g.config, unhealthyMs: 0, graceMs: 30_000 };
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, localState: 'ready' });
-  const invoke = g.cli.bind(g);
-  g.cli = async (args, timeout, beforeExecute) => {
-    if (args[1] === 'down') {
-      await beforeExecute();
-      throw new Error('Synthetic interruption before stop');
-    }
-    return invoke(args, timeout, beforeExecute);
+  const save = g.save.bind(g);
+  g.save = async state => {
+    await save(state);
+    if (state.pendingRecovery?.phase === 'stopping' && state.lastRecovery?.outcome === 'started')
+      throw new Error('Synthetic interruption after journal save, before stop');
   };
-  let state = await g.tick(base());
+  let state = await g.tick((await overdue(g)).state);
   const old = await g.owner();
   const restarted = reopenGuard(g);
   restarted.now = () => state.pendingRecovery.nextAttemptAt;
@@ -1386,7 +1466,8 @@ test('retry rechecks actual instance identity before any destructive command', a
   g.now = () => now;
   g.config = { ...g.config, unhealthyMs: 0 };
   const old = staleOffline(now);
-  const state = { ...base(), restarts: [now - 2_000_000, now - 1_500_000, now - 1_000_000] };
+  const state = advance({ ...base(), restarts: [now - 2_000_000, now - 1_500_000, now - 1_000_000] },
+    old, now - g.config.disconnectedMs, now - g.config.intervalMs, false, g.config);
   let count = 0;
   g.probe = async () => ++count === 1 ? old : {
     ...old, kind: 'another_runtime', remoteRuntimeId: 'genuine-competitor',
@@ -1407,8 +1488,8 @@ test('successful recovery ignores legacy limits and clears backoff before a subs
   await g.cli(['runtime', 'up']);
   await setFixture(g, { stuck: true, localState: 'ready', remoteRecord: disconnectedRecord(clock) });
   const before = await g.probe();
-  let state = await g.tick({ ...base(), restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000],
-    lastEscalationAt: clock });
+  let state = await g.tick((await overdue(g, { ...base(),
+    restarts: [clock - 2_000_000, clock - 1_500_000, clock - 1_000_000], lastEscalationAt: clock })).state);
   assert.equal(state.lastRecovery.mode, 'normal');
   assert.equal(state.lastRecovery.outcome, 'recovered');
   assert.equal(state.restarts.length, 4);
@@ -1417,9 +1498,15 @@ test('successful recovery ignores legacy limits and clears backoff before a subs
   await setFixture(g, { stuck: true });
   clock += CONFIG.retryBaseMs;
   state = await reopenGuard(g).tick(await g.loadState());
+  assert.equal(state.action, 'observe', 'the next outage gets a new four-minute window');
+  state = advance(state, await g.probe(), clock + g.config.intervalMs,
+    clock + g.config.disconnectedMs - g.config.intervalMs, false, g.config);
+  clock += g.config.disconnectedMs;
+  state = await reopenGuard(g).tick(state);
   assert.equal(state.action, 'recover');
   assert.equal(state.lastRecovery.outcome, 'recovered');
-  assert.equal((await calls(g)).filter(a => a[1] === 'down').length, 2);
+  const events = (await fs.readFile(g.logFile, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(events.filter(e => e.event === 'graceful_stop').length, 2);
 });
 
 test('a successful startup followed by an unavailable probe does not cause a duplicate startup', async t => {
@@ -1490,7 +1577,7 @@ test('instance conflict notices survive restarts without notifying on every poll
   assert.ok((await calls(g)).every(a => !['up', 'down'].includes(a[1])));
 });
 
-test('10-20 timeline replay: active work is retained and confirmed idle recovery still works', () => {
+test('10-20 timeline replay retains active work and workspace-only failures', () => {
   const at = time => Date.parse(`2026-10-20T${time}+08:00`);
   let state = base();
   const sample = { ...failed, executionActivity: { state: 'active' },
@@ -1500,14 +1587,14 @@ test('10-20 timeline replay: active work is retained and confirmed idle recovery
   assert.equal(state.reason, 'execution_active');
   state = { ...state, restarts: [at('16:56:25')], pendingRecovery: null };
   state = decide(state, { kind: 'healthy' }, at('16:56:42'), false, CONFIG);
-  const bridgeLost = { ...failed, pid: 301, runtimeId: 'runtime-b' };
-  state = advance(state, bridgeLost, at('17:07:47'), at('17:09:57'), false, CONFIG);
-  assert.equal(state.action, 'recover');
-  // The integration test above exercises the real stop/old-lease/resume sequence.
-  state.restarts.push(at('17:10:03'));
-  state = decide(state, { kind: 'healthy' }, at('17:10:30'), false, CONFIG);
-  assert.equal(state.restarts.length, 2);
-  const latest = { ...sample, pid: 302, runtimeId: 'runtime-c',
+  const bridgeLost = { ...failed, kind: 'workspace_unavailable', pid: 301, runtimeId: 'runtime-b',
+    harnessConnected: true, workspaceConnected: false };
+  state = advance(state, bridgeLost, at('17:07:47'), at('17:12:57'), false, CONFIG);
+  assert.equal(state.action, 'observe');
+  assert.equal(state.failureSince, null);
+  state = decide(state, { kind: 'healthy' }, at('17:13:00'), false, CONFIG);
+  assert.equal(state.restarts.length, 1);
+  const latest = { ...sample, pid: 301, runtimeId: 'runtime-b',
     transportFailure: { code: 1006, activeExecutions: 1, closedAt: at('17:35:05') } };
   state = advance(state, latest, at('17:35:13'), at('17:35:33'), false, CONFIG);
   assert.equal(state.action, 'observe');

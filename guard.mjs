@@ -251,6 +251,8 @@ export function summarizeStatus(raw, config = CONFIG) {
   else if (raw.remote.online && (!local || raw.remote.runtimeId !== local.runtimeId)) kind = 'another_runtime';
   else if (!local) kind = 'process_down';
   else if (local.state === 'ready' && local.harnessConnected && local.workspaceConnected && raw.remote.online && raw.remote.workspace?.online === true) kind = 'healthy';
+  else if (['starting', 'reconnecting', 'stopping', 'ready'].includes(local.state) && local.harnessConnected &&
+      (!local.workspaceConnected || !raw.remote.workspace.online)) kind = 'workspace_unavailable';
   else if (['starting', 'reconnecting', 'stopping', 'ready'].includes(local.state)) kind = 'connection_stuck';
   else kind = 'attention';
   return {
@@ -279,19 +281,16 @@ export function retryDelay(attempts, config = CONFIG) {
     2 ** Math.min(Math.max(0, attempts - 1), Math.ceil(Math.log2(config.retryMaxMs / config.retryBaseMs))));
 }
 
-function disconnected(sample, state = null) {
-  const pending = state?.pendingRecovery;
-  const stopping = sample.localState === 'stopping' && pending?.phase === 'stopping' &&
-    pending.trigger === 'disconnect_timeout' && pending.sourcePid === sample.pid &&
-    pending.sourceRuntimeId === sample.runtimeId;
+function disconnected(sample) {
+  // The supervisor's aggregate state also says reconnecting when only the
+  // workspace relay is down. Only a disconnected task/control channel can
+  // authorize interrupting the worker, regardless of workspace availability.
   return sample.kind === 'connection_stuck' && !!sample.pid && !sample.transportEvidenceError &&
-    (sample.localState === 'reconnecting' || Number.isFinite(sample.heartbeatTimeoutAt) || stopping);
+    sample.harnessConnected === false;
 }
 
-function disconnectExpired(sample, state, config, afterTerm = false) {
-  const stillDisconnected = disconnected(sample, state) || (afterTerm && sample.kind === 'connection_stuck' &&
-    sample.localState === 'stopping' && !sample.transportEvidenceError);
-  return stillDisconnected && state?.candidate === `connection_stuck:${sample.runtimeId}` &&
+function disconnectExpired(sample, state, config) {
+  return disconnected(sample) && state?.candidate === `connection_stuck:${sample.runtimeId}` &&
     state.sample?.pid === sample.pid && state.sample?.runtimeId === sample.runtimeId &&
     Number.isFinite(state.failureSince) && Number.isFinite(state.checkedAt) &&
     state.checkedAt - state.failureSince >= config.disconnectedMs &&
@@ -305,7 +304,7 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
   const gap = previous.checkedAt !== null && (now - previous.checkedAt > config.intervalMs * 3 || now < previous.checkedAt);
   if (!key || paused) { next.candidate = null; next.failureSince = null; }
   else if (key !== previous.candidate || gap ||
-      (disconnected(sample, next) && (!disconnected(previous.sample ?? {}, previous) || previous.sample.pid !== sample.pid ||
+      (disconnected(sample) && (!disconnected(previous.sample ?? {}) || previous.sample.pid !== sample.pid ||
         sample.connectionRecoveredAt > previous.failureSince))) {
     next.candidate = key; next.failureSince = now;
   }
@@ -313,12 +312,12 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
   next.reason = paused ? 'paused' : sample.kind;
   const protectedExecution = executionProtection(sample, next, config);
   if (!paused && protectedExecution) {
-    if (!disconnected(sample, next)) { next.candidate = null; next.failureSince = null; }
+    if (!disconnected(sample)) { next.candidate = null; next.failureSince = null; }
     next.reason = protectedExecution;
     return next;
   }
   // Neither an idle count nor an old retry journal can shorten a new transport outage.
-  if (!paused && disconnected(sample, next) && !disconnectExpired(sample, next, config)) return next;
+  if (!paused && disconnected(sample) && !disconnectExpired(sample, next, config)) return next;
   const pending = previous.pendingRecovery;
   if (sample.kind === 'healthy') next.retry = null;
   // Old journals may contain a 15-minute nextAttemptAt. Recompute only the short delay.
@@ -345,7 +344,7 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
     }
     return next;
   }
-  const confirmationMs = disconnected(sample, next) ? config.disconnectedMs : config.unhealthyMs;
+  const confirmationMs = disconnected(sample) ? config.disconnectedMs : config.unhealthyMs;
   if (!key || paused || (retry?.candidate !== key && now - next.failureSince < confirmationMs)) return next;
   if (retryAt !== null && now < retryAt) {
     next.reason = 'retry_backoff';
@@ -359,6 +358,7 @@ export function decide(previous, sample, now, paused, config = CONFIG) {
 }
 
 export function executionProtection(sample, outage = null, config = CONFIG) {
+  if (sample.pid && sample.kind === 'workspace_unavailable') return 'workspace_unavailable';
   if (!sample.pid || sample.kind !== 'connection_stuck') return null;
   if (disconnectExpired(sample, outage, config)) return null;
   if (sample.executionActivity?.state === 'active' ||
@@ -802,9 +802,9 @@ export class Guard {
     if (executionProtection(fresh, outage, this.config))
       return { outcome: 'skipped', reason: executionProtection(fresh, outage, this.config) };
     const prolongedDisconnect = disconnectExpired(sample, outage, this.config);
-    const safeToStop = (latest, afterTerm = false) => latest.kind === sample.kind && latest.pid === sample.pid &&
+    const safeToStop = latest => latest.kind === sample.kind && latest.pid === sample.pid &&
       latest.runtimeId === sample.runtimeId && (prolongedDisconnect
-        ? disconnectExpired(latest, outage, this.config, afterTerm) : !executionProtection(latest));
+        ? disconnectExpired(latest, outage, this.config) : !executionProtection(latest));
     if (!safeToStop(fresh)) return { outcome: 'skipped', reason: 'Connection recovered since probe' };
     if (!prolongedDisconnect && sample.transportFailure && JSON.stringify(fresh.transportFailure) !== JSON.stringify(sample.transportFailure))
       return { outcome: 'skipped', reason: 'Execution disconnect evidence changed since probe' };
@@ -869,7 +869,7 @@ export class Guard {
       const remaining = await this.processIdentity(sample.pid);
       if (remaining) {
         const latest = await this.probe();
-        if (latest.kind !== 'connection_stuck' || !safeToStop(latest, prolongedDisconnect) || await this.paused())
+        if (latest.kind !== 'connection_stuck' || !safeToStop(latest) || await this.paused())
           throw new Error('Execution safety unknown before forced stop; retaining Runtime');
         const current = await this.owner();
         if (!current || current.pid !== owner.pid || current.nonce !== owner.nonce || remaining !== identity)
@@ -983,7 +983,7 @@ export class Guard {
         error: redact(error.message), since: now, checkedAt: now, nextCheckAt: now + this.config.intervalMs, blockRecovery: true };
     }
     if (state.pendingRecovery && (sample.kind === 'healthy' ||
-        (sample.kind === 'connection_stuck' && sample.pid &&
+        (['connection_stuck', 'workspace_unavailable'].includes(sample.kind) && sample.pid &&
           (sample.pid !== state.pendingRecovery.sourcePid || sample.runtimeId !== state.pendingRecovery.sourceRuntimeId)))) {
       // A start may have succeeded before its caller timed out or the guard exited.
       // Never reuse the pending stop authorization against a replacement process.
@@ -1004,14 +1004,18 @@ export class Guard {
     await this.save(next);
     await this.log('health', { paused, sample, decision: next.reason, networkRoute: next.networkRoute,
       nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null });
-    if (['recovery_conflict', 'another_runtime'].includes(next.reason)) {
-      const key = `${next.reason}:${sample.runtimeId ?? 'absent'}:${sample.remoteRuntimeId ?? 'absent'}`;
+    if (sample.kind === 'workspace_unavailable' || ['recovery_conflict', 'another_runtime'].includes(next.reason)) {
+      const workspaceOnly = sample.kind === 'workspace_unavailable';
+      const reason = workspaceOnly ? 'workspace_unavailable' : next.reason;
+      const event = workspaceOnly ? 'workspace_unavailable' : 'recovery_blocked';
+      const key = `${reason}:${sample.runtimeId ?? 'absent'}:${sample.remoteRuntimeId ?? 'absent'}`;
       if (next.lastNotice?.key !== key || this.now() - next.lastNotice.at >= 60_000) {
-        const notice = { reason: next.reason, runtimeId: sample.runtimeId, remoteRuntimeId: sample.remoteRuntimeId,
+        const notice = { event, reason, runtimeId: sample.runtimeId, remoteRuntimeId: sample.remoteRuntimeId,
           nextEligibleAt: next.nextEligibleAt, operationId: next.pendingRecovery?.id ?? null,
           remoteEvidenceError: sample.remoteEvidenceError ?? null,
-          message: 'Recovery blocked; inspect the recorded reason and next eligible time. No task was replayed.' };
-        await this.log('recovery_blocked', notice);
+          message: workspaceOnly ? 'Workspace relay unavailable; task/control connection is live. Worker retained.'
+            : 'Recovery blocked; inspect the recorded reason and next eligible time. No task was replayed.' };
+        await this.log(event, notice);
         this.notify(notice);
         next.lastNotice = { key, at: this.now() };
         await this.save(next);

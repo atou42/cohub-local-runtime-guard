@@ -28,11 +28,13 @@ if (args[0] === 'network-env') {
   const o = await owner();
   const running = o && alive(o.pid);
   const healthy = running && !setup.stuck;
+  const harnessConnected = !!running && (setup.stuck ? setup.harnessConnected ?? false : true);
+  const workspaceConnected = !!running && (setup.stuck ? setup.workspaceConnected ?? false : true);
   emit({ spaceId: setup.spaceId, local: running ? {
     pid: o.pid, runtimeId: o.runtimeId, root: setup.root ?? home, spaceId: setup.spaceId,
     harnesses: setup.harnesses ?? ['codex', 'pi'], state: healthy ? 'ready' : setup.localState ?? 'reconnecting',
-    harnessConnected: !!healthy, workspaceConnected: !!healthy,
-  } : null, remote: setup.remote ?? { online: !!healthy, runtimeId: healthy ? o.runtimeId : null, workspace: { online: !!healthy } },
+    harnessConnected, workspaceConnected,
+  } : null, remote: setup.remote ?? { online: harnessConnected, runtimeId: harnessConnected ? o.runtimeId : null, workspace: { online: workspaceConnected } },
   remoteError: null, nativeSyncError: null, pendingLocalArchives: 0 });
 } else if (args[1] === 'down') {
   const o = await owner();

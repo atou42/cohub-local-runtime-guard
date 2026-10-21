@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "generation": "0.1.39",
+  "treeSha256": "41ff53c9e2958496d44a96775d8562fe76c199032ce436fa2fc0e33499287d26",
+  "packages": [
+    {
+      "path": "@emnapi/runtime",
+      "name": "@emnapi/runtime",
+      "version": "1.11.3"
+    },
+    {
+      "path": "@img/colour",
+      "name": "@img/colour",
+      "version": "1.1.0"
+    },
+    {
+      "path": "@img/sharp-darwin-arm64",
+      "name": "@img/sharp-darwin-arm64",
+      "version": "0.35.5"
+    },
+    {
+      "path": "@img/sharp-libvips-darwin-arm64",
+      "name": "@img/sharp-libvips-darwin-arm64",
+      "version": "1.3.4"
+    },
+    {
+      "path": "@img/sharp-wasm32",
+      "name": "@img/sharp-wasm32",
+      "version": "0.35.5"
+    },
+    {
+      "path": "@napi-rs/canvas",
+      "name": "@napi-rs/canvas",
+      "version": "1.0.11"
+    },
+    {
+      "path": "@napi-rs/canvas-darwin-arm64",
+      "name": "@napi-rs/canvas-darwin-arm64",
+      "version": "1.0.11"
+    },
+    {
+      "path": "@neta-art/cohub",
+      "name": "@neta-art/cohub",
+      "version": "11.5.0"
+    },
+    {
+      "path": "@neta-art/generation",
+      "name": "@neta-art/generation",
+      "version": "0.1.39"
+    },
+    {
+      "path": "@openrouter/sdk",
+      "name": "@openrouter/sdk",
+      "version": "1.4.25"
+    },
+    {
+      "path": "@typesafe-ai/sdk",
+      "name": "@typesafe-ai/sdk",
+      "version": "0.6.0"
+    },
+    {
+      "path": "commander",
+      "name": "commander",
+      "version": "15.0.0"
+    },
+    {
+      "path": "detect-libc",
+      "name": "detect-libc",
+      "version": "2.1.2"
+    },
+    {
+      "path": "es-module-lexer",
+      "name": "es-module-lexer",
+      "version": "2.3.2"
+    },
+    {
+      "path": "perfect-freehand",
+      "name": "perfect-freehand",
+      "version": "1.2.3"
+    },
+    {
+      "path": "semver",
+      "name": "semver",
+      "version": "7.8.5"
+    },
+    {
+      "path": "sharp",
+      "name": "sharp",
+      "version": "0.35.5"
+    },
+    {
+      "path": "tslib",
+      "name": "tslib",
+      "version": "2.8.1"
+    },
+    {
+      "path": "ws",
+      "name": "ws",
+      "version": "8.22.0"
+    },
+    {
+      "path": "yaml",
+      "name": "yaml",
+      "version": "2.9.1"
+    },
+    {
+      "path": "zod",
+      "name": "zod",
+      "version": "4.6.7"
+    }
+  ]
+}
